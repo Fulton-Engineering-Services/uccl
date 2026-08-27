@@ -23,9 +23,6 @@ import sys
 from utils import (
     init_dist,
     detect_ib_hca,
-    get_cpu_proxies_meta,
-    initialize_uccl,
-    destroy_uccl,
 )
 
 
@@ -59,18 +56,11 @@ def test_simple_internode(
         device_index
     ).multi_processor_count
 
-    scratch_nbytes = int(1e9)  # 256 MB
-    scratch = torch.empty(
-        scratch_nbytes, dtype=torch.uint8, device=f"cuda:{device_index}"
-    )
-    proxies, workers = initialize_uccl(
-        scratch.data_ptr(), scratch_nbytes, rank, num_ranks, group
-    )
+    scratch_nbytes = int(1e9)  # 1 GB
 
     try:
         buffer = Buffer(
             group=group,
-            rdma_buffer_ptr=scratch.data_ptr(),
             num_nvl_bytes=0,
             num_rdma_bytes=int(scratch_nbytes),
             low_latency_mode=True,
@@ -83,6 +73,7 @@ def test_simple_internode(
         if rank == 0:
             print("[simple-test] ✓ Buffer created successfully", flush=True)
 
+        proxies = buffer.proxies
         buffer.connect_atomic_buffer(proxies[0])
 
         for proxy in proxies:
@@ -157,9 +148,6 @@ def test_simple_internode(
 
     dist.barrier()
     print("[simple-test] ✓ Buffer destroyed", flush=True)
-
-    destroy_uccl(proxies, workers)
-    dist.barrier()
 
 
 def test_worker(
