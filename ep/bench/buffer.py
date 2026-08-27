@@ -84,6 +84,7 @@ class Buffer:
         allow_mnnvl: bool = False,
         explicitly_destroy: bool = False,
         is_intranode: Optional[bool] = None,
+        enable_shrink: bool = False,
     ) -> None:
         """
         Initialize the communication buffer.
@@ -171,6 +172,10 @@ class Buffer:
         self.num_rdma_bytes = num_rdma_bytes
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
+        # DeepEP-vLLM API-compat: vLLM's DeepEPLLAll2AllManager always passes
+        # enable_shrink (fault-tolerance rank shrink/expand). UCCL EP does not
+        # support dynamic rank shrink, so accept and record it but do not act.
+        self.enable_shrink = enable_shrink
         self._next_low_latency_combine_buffer = None
         self.runtime = ep.Buffer(
             self.rank,
@@ -270,6 +275,27 @@ class Buffer:
         assert new_num_sms % 2 == 0, "The SM count must be even"
         Buffer.num_sms = new_num_sms
 
+    def low_latency_query_mask_buffer(self, mask: torch.Tensor) -> None:
+        """
+        Write the active-rank mask into ``mask`` for DeepEP fault-tolerance
+        compatibility.
+
+        UCCL EP does not support dynamic rank shrink/expand, so every rank is
+        always active. Fill the mask with ``1`` (active) to report a stable
+        topology; vLLM's ``query_fault`` compares consecutive masks and will
+        therefore never detect a fault.
+        """
+        mask.fill_(1)
+
+    def low_latency_clean_mask_buffer(self) -> None:
+        """
+        No-op for DeepEP fault-tolerance compatibility.
+
+        UCCL EP has no per-rank mask buffer to clean; kept so vLLM's
+        ``DeepEPLLAll2AllManager.clean_buffers`` can call it unconditionally.
+        """
+        return
+
     @staticmethod
     def capture() -> EventOverlap:
         """
@@ -293,6 +319,8 @@ class Buffer:
         use_fp8: bool = True,
         round_scale: bool = False,
         use_ue8m0: bool = False,
+        use_nvfp4: bool = False,
+        x_global_scale: Optional[torch.Tensor] = None,
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ) -> Tuple[
@@ -345,6 +373,13 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
+        if use_nvfp4:
+            raise NotImplementedError(
+                "low_latency_dispatch(use_nvfp4=True) is not implemented yet. "
+                "The use_nvfp4/x_global_scale kwargs are accepted for API "
+                "compatibility with DeepEP's hybrid-ep NVFP4 dispatch; UCCL EP "
+                "dispatches FP8/BF16 activations."
+            )
         for proxy in self.proxies:
             proxy.notify_proxy_thread_adaptive_sleeper()
             proxy.calculate_and_set_dispatch_recv_data_offset(
