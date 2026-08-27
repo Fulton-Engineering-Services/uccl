@@ -113,7 +113,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
 
 #ifdef PER_EXPERT_BATCHING
   // Global counter slots used for batching sends to each top-k destination.
-  constexpr int kNumMaxTopK = 16;
+  constexpr int kNumMaxTopK = 24;
   __shared__ int shared_send_slots[kNumMaxTopK];
   __shared__ int shared_dst_experts[kNumMaxTopK];
 #endif
@@ -667,9 +667,13 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               int max_nvl_peers, int low_latency_buffer_idx,
               void** ipc_rdma_base_ptrs, void* rdma_buffer_ptr,
               void* atomic_buffer_ptr, int64_t* rdma_recv_count_internode) {
-  constexpr int kNumMaxTopK = 16;
-  int const num_warp_groups = ceil_div(num_experts, num_device_sms);
-  int const num_warps_per_group = kNumMaxWarpGroups / num_warp_groups;
+  constexpr int kNumMaxTopK = 24;
+  int num_warp_groups = ceil_div(num_experts, num_device_sms);
+  int num_warps_per_group = kNumMaxWarpGroups / num_warp_groups;
+  if (num_warp_groups * num_warps_per_group < num_topk + 1) {
+    num_warp_groups = 16;
+    num_warps_per_group = kNumMaxWarpGroups / num_warp_groups;
+  }
   EP_HOST_ASSERT(num_warp_groups > 0 and num_warps_per_group > 0);
   EP_HOST_ASSERT(kNumMaxTopK + 1 <= num_warp_groups * num_warps_per_group);
 
