@@ -671,7 +671,12 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
   int num_warp_groups = ceil_div(num_experts, num_device_sms);
   int num_warps_per_group = kNumMaxWarpGroups / num_warp_groups;
   if (num_warp_groups * num_warps_per_group < num_topk + 1) {
-    num_warp_groups = 16;
+    // On low-SM devices (e.g. GB10 with 48 SMs) and large expert counts
+    // (e.g. 512 global experts from vLLM), ceil_div produces too few warp
+    // groups to satisfy num_topk+1 warps. Pick the largest num_warp_groups
+    // that keeps num_warps_per_group > 1 and num_warp_groups < 15 (the
+    // device-side assertion at the dispatch kernel entry).
+    num_warp_groups = 14;
     num_warps_per_group = kNumMaxWarpGroups / num_warp_groups;
   }
   EP_HOST_ASSERT(num_warp_groups > 0 and num_warps_per_group > 0);
@@ -1238,9 +1243,13 @@ void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
              int low_latency_buffer_idx, void** ipc_rdma_base_ptrs,
              void* rdma_buffer_ptr, void* atomic_buffer_ptr,
              int64_t* rdma_recv_flag_internode) {
-  constexpr int kNumMaxTopk = 16;
-  int const num_warp_groups = ceil_div(num_experts, num_device_sms);
-  int const num_warps_per_group = kNumMaxWarpGroups / num_warp_groups;
+  constexpr int kNumMaxTopk = 24;
+  int num_warp_groups = ceil_div(num_experts, num_device_sms);
+  int num_warps_per_group = kNumMaxWarpGroups / num_warp_groups;
+  if (num_warp_groups * num_warps_per_group < num_topk + 1) {
+    num_warp_groups = 15;
+    num_warps_per_group = kNumMaxWarpGroups / num_warp_groups;
+  }
   EP_HOST_ASSERT(num_warp_groups > 0 and num_warps_per_group > 0);
 
   auto const num_warps = num_warp_groups * num_warps_per_group;
