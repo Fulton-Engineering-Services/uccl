@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "uccl"
-version = "0.1.1"
+version = "0.1.2"
 description = "UCCL: Ultra and Unified CCL"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = "Apache-2.0"
