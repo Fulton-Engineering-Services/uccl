@@ -12,6 +12,7 @@ torchrun --nnodes=2 --nproc_per_node=1 --node_rank=1 \
   bench/test_internode_simple.py
 """
 
+import argparse
 import torch
 import torch.distributed as dist
 import time
@@ -28,13 +29,22 @@ from utils import (
 )
 
 
-def test_simple_internode(rank: int, num_ranks: int, group: dist.ProcessGroup):
-    num_tokens = 512
-    hidden = 2048
-    num_experts = 3 * num_ranks
-    num_topk = 4
+def test_simple_internode(
+    rank: int,
+    num_ranks: int,
+    group: dist.ProcessGroup,
+    num_tokens: int = 512,
+    hidden: int = 2048,
+    num_experts: int = 3,
+    num_topk: int = 4,
+):
     device_index = int(os.environ["LOCAL_RANK"])
     print(f"[simple-test] Running on device {device_index}", flush=True)
+    print(
+        f"[simple-test] config: num_tokens={num_tokens}, hidden={hidden}, "
+        f"num_experts={num_experts}, num_topk={num_topk}",
+        flush=True,
+    )
 
     torch.manual_seed(rank)
     x = torch.randn(
@@ -150,17 +160,45 @@ def test_simple_internode(rank: int, num_ranks: int, group: dist.ProcessGroup):
     dist.barrier()
 
 
-def test_worker(local_rank: int, num_local_ranks: int):
+def test_worker(
+    local_rank: int,
+    num_local_ranks: int,
+    num_tokens: int = 512,
+    hidden: int = 2048,
+    num_experts: int = 3,
+    num_topk: int = 4,
+):
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
 
     try:
-        test_simple_internode(rank, num_ranks, group)
+        test_simple_internode(
+            rank,
+            num_ranks,
+            group,
+            num_tokens=num_tokens,
+            hidden=hidden,
+            num_experts=num_experts,
+            num_topk=num_topk,
+        )
     finally:
         dist.barrier()
         dist.destroy_process_group()
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="UCCL EP internode smoke test")
+    parser.add_argument(
+        "--num-tokens", type=int, default=512, help="Number of tokens to dispatch"
+    )
+    parser.add_argument("--hidden", type=int, default=2048, help="Hidden dimension")
+    parser.add_argument(
+        "--num-experts", type=int, default=3, help="Number of experts (total)"
+    )
+    parser.add_argument(
+        "--num-topk", type=int, default=4, help="Top-k experts per token"
+    )
+    args = parser.parse_args()
+
     ib_dev = detect_ib_hca()
     if ib_dev and ib_dev.startswith("mlx"):  # Mellanox IB devices show up like mlx5_0
         os.environ["NCCL_IB_HCA"] = ib_dev
@@ -168,4 +206,11 @@ if __name__ == "__main__":
     print("Simple internode test starting...")
     local_rank = int(os.environ["LOCAL_RANK"])
     num_local_ranks = int(os.environ["LOCAL_WORLD_SIZE"])
-    test_worker(local_rank, num_local_ranks)
+    test_worker(
+        local_rank,
+        num_local_ranks,
+        num_tokens=args.num_tokens,
+        hidden=args.hidden,
+        num_experts=args.num_experts,
+        num_topk=args.num_topk,
+    )
