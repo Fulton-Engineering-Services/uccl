@@ -45,6 +45,10 @@
 #define SWITCH_HIDDEN(case_macro)                       \
   do {                                                  \
     switch (hidden) {                                   \
+      case 1024:                                        \
+        case_macro(1024);                               \
+      case 1536:                                        \
+        case_macro(1536);                               \
       case 2048:                                        \
         case_macro(2048);                               \
       case 2560:                                        \

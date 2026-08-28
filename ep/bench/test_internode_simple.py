@@ -56,7 +56,7 @@ def test_simple_internode(
         device_index
     ).multi_processor_count
 
-    scratch_nbytes = int(1e9)  # 1 GB
+    scratch_nbytes = int(8e9)  # 8 GB (512 experts x 2 ranks x 512 tokens needs ~4 GB)
 
     try:
         buffer = Buffer(
