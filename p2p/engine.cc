@@ -1378,9 +1378,15 @@ bool Endpoint::write_all_async(std::vector<uint64_t> const& conn_ids,
 
 bool Endpoint::wait_async(uint64_t transfer_id, uint64_t timeout_us) {
   TransferStatus* status = nullptr;
-  if (!claim_transfer(transfer_id, &status)) {
-    // Unknown/stale id: either already freed by another waiter (it reported
-    // done) or never handed out. Report completion without touching memory.
+  auto claim = begin_wait(transfer_id, &status);
+  if (claim == ClaimResult::Unknown) {
+    // Retired (already completed and freed) or never handed out: report
+    // completion without touching memory.
+    return true;
+  }
+  if (claim == ClaimResult::Busy) {
+    // Another wait_async owns this id; it will complete it. Report success
+    // to avoid a second blocking waiter on one id.
     return true;
   }
   auto const deadline =
@@ -1395,13 +1401,12 @@ bool Endpoint::wait_async(uint64_t transfer_id, uint64_t timeout_us) {
       if (poll_batch_ureqs(ep_, status)) break;
     } else if (status->poll_net_ureq) {
       if (uccl_poll_ureq_once(ep_, &status->ureq)) break;
-    } else if (status->task_ptr) {
-      // Task-based transfers (writev_async, large write_async/read_async):
-      // the send/recv proxy thread completes them via status->done.
-      if (status->done.load(std::memory_order_acquire)) break;
     } else {
-      // Nothing to poll and no task: treat as complete.
-      break;
+      // Task-based (writev_async, large write_async/read_async) AND IPC
+      // async transfers: no poll mode — completion is signaled by the
+      // owning proxy thread via status->done. Wait on it; "no poll mode
+      // and no task" is the same contract.
+      if (status->done.load(std::memory_order_acquire)) break;
     }
     if ((++spin & 1023) == 0 && inside_python) {
       check_python_signals();
@@ -1413,10 +1418,11 @@ bool Endpoint::wait_async(uint64_t transfer_id, uint64_t timeout_us) {
     std::this_thread::yield();
   }
   if (timed_out) {
-    release_transfer(transfer_id, status);
+    end_wait(transfer_id, status, /*completed=*/false);
     return false;
   }
   status->done.store(true, std::memory_order_release);
+  end_wait(transfer_id, status, /*completed=*/true);
   delete status;
   return true;
 }
@@ -1453,23 +1459,53 @@ bool Endpoint::wait_flags(std::vector<uint64_t> const& flag_addrs, int32_t seq,
 
 uint64_t Endpoint::register_transfer(TransferStatus* status) {
   std::lock_guard<std::mutex> lock(transfer_status_mu_);
-  uint64_t const id = reinterpret_cast<uint64_t>(status);
-  active_transfers_[id] = status;
+  // Monotonic id (1-based; 0 is the failure sentinel) — heap addresses would
+  // be ABA-prone after delete + allocator reuse.
+  uint64_t const id = next_transfer_id_.fetch_add(1) + 1;
+  active_transfers_[id] = TransferEntry{status, /*claimed=*/false};
   return id;
 }
 
-bool Endpoint::claim_transfer(uint64_t transfer_id, TransferStatus** out) {
+ClaimResult Endpoint::begin_wait(uint64_t transfer_id, TransferStatus** out) {
   std::lock_guard<std::mutex> lock(transfer_status_mu_);
   auto it = active_transfers_.find(transfer_id);
-  if (it == active_transfers_.end()) return false;
-  *out = it->second;
-  active_transfers_.erase(it);
-  return true;
+  if (it == active_transfers_.end()) return ClaimResult::Unknown;
+  if (it->second.claimed) return ClaimResult::Busy;
+  it->second.claimed = true;
+  *out = it->second.status;
+  return ClaimResult::Ok;
 }
 
-void Endpoint::release_transfer(uint64_t transfer_id, TransferStatus* status) {
+ClaimResult Endpoint::begin_poll(uint64_t transfer_id, TransferStatus** out) {
   std::lock_guard<std::mutex> lock(transfer_status_mu_);
-  active_transfers_[transfer_id] = status;
+  auto it = active_transfers_.find(transfer_id);
+  if (it == active_transfers_.end()) return ClaimResult::Unknown;
+  if (it->second.claimed) return ClaimResult::Busy;
+  // Sole ownership for the duration of this poll pass.
+  *out = it->second.status;
+  active_transfers_.erase(it);
+  return ClaimResult::Ok;
+}
+
+void Endpoint::end_wait(uint64_t transfer_id, TransferStatus* status,
+                        bool completed) {
+  std::lock_guard<std::mutex> lock(transfer_status_mu_);
+  if (completed) {
+    active_transfers_.erase(transfer_id);
+  } else {
+    auto& entry = active_transfers_[transfer_id];
+    entry.status = status;
+    entry.claimed = false;
+  }
+}
+
+void Endpoint::end_poll(uint64_t transfer_id, TransferStatus* status,
+                        bool completed) {
+  if (!completed) {
+    std::lock_guard<std::mutex> lock(transfer_status_mu_);
+    active_transfers_[transfer_id] = TransferEntry{status, /*claimed=*/false};
+  }
+  // completed: the id was already erased by begin_poll.
 }
 
 bool Endpoint::ar_lane_setup(
@@ -2672,6 +2708,15 @@ bool Endpoint::remove_remote_endpoint(uint64_t conn_id) {
 
   Conn* conn = it->second;
 
+  // Close the peek-release-reacquire gap: a concurrent ar_lane_setup could
+  // have resolved this conn and started a lane while the lock was released.
+  // stop_lanes_for_* joins are bounded (lane->stop checked in the repost
+  // loop), so joining under conn_mu_ terminates promptly.
+  stop_lanes_for_conn(conn_id);
+  if (loopback_conn_id != UINT64_MAX) {
+    stop_lanes_for_conn(loopback_conn_id);
+  }
+
   // Detach shared memory if this was a local connection
   if (conn->shm_attached_) {
     auto& shm = conn->remote_inbox_;
@@ -2720,11 +2765,18 @@ bool Endpoint::start_passive_accept() {
 
 bool Endpoint::poll_async(uint64_t transfer_id, bool* is_done) {
   TransferStatus* status = nullptr;
-  if (!claim_transfer(transfer_id, &status)) {
-    // Unknown/stale id: already freed by wait_async/poll_async (which only
-    // frees on completion) or never handed out. Report done without touching
-    // possibly-freed memory.
+  auto claim = begin_poll(transfer_id, &status);
+  if (claim == ClaimResult::Unknown) {
+    // Retired: already completed and freed by wait_async/poll_async (both
+    // only free on completion) or never handed out. Report done without
+    // touching possibly-freed memory.
     *is_done = true;
+    return true;
+  }
+  if (claim == ClaimResult::Busy) {
+    // Claimed by another thread's wait_async — the transfer is still in
+    // progress. Never touch the status object (its owner may free it).
+    *is_done = false;
     return true;
   }
   if (status->poll_net_ureq_batch &&
@@ -2740,9 +2792,10 @@ bool Endpoint::poll_async(uint64_t transfer_id, bool* is_done) {
   }
   *is_done = status->done.load(std::memory_order_acquire);
   if (*is_done) {
+    end_poll(transfer_id, status, /*completed=*/true);
     delete status;
   } else {
-    release_transfer(transfer_id, status);
+    end_poll(transfer_id, status, /*completed=*/false);
   }
   return true;
 }

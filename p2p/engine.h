@@ -244,6 +244,9 @@ struct IpcInflightOp {
   std::vector<int> gpu_idxs_v;
 };
 
+// Result of claiming a transfer id from the endpoint registry.
+enum class ClaimResult { Ok, Busy, Unknown };
+
 // EP-style AR lane (pattern from uccl/ep's D2H queue + proxy): the producer
 // lays [data | 4B seq flag] into the lane's send-ring slot, then stores the
 // round seq into a producer-owned pinned seq word. A dedicated thread polls
@@ -425,14 +428,15 @@ class Endpoint {
   bool stop_lanes_for_conn(uint64_t conn_id);
   bool stop_lanes_for_mr(uint64_t mr_id);
 
-  /* Out-of-band ownership for transfer ids (transfer_id -> TransferStatus).
-   * poll_async/wait_async CLAIM an id by erasing it from the map under the
-   * lock — from then on no other thread can reach the object through the
-   * id — and release it back if not done, so an unknown/stale id is seen
-   * without touching possibly-freed memory. */
+  /* Out-of-band ownership for transfer ids. Ids are monotonic (not heap
+   * addresses — ABA-safe). A claimed id STAYS in the map flagged claimed so
+   * concurrent pollers distinguish "in progress by another waiter" (report
+   * not-done, never touch the object) from "retired" (report done). */
   uint64_t register_transfer(TransferStatus* status);
-  bool claim_transfer(uint64_t transfer_id, TransferStatus** out);
-  void release_transfer(uint64_t transfer_id, TransferStatus* status);
+  ClaimResult begin_wait(uint64_t transfer_id, TransferStatus** out);
+  ClaimResult begin_poll(uint64_t transfer_id, TransferStatus** out);
+  void end_wait(uint64_t transfer_id, TransferStatus* status, bool completed);
+  void end_poll(uint64_t transfer_id, TransferStatus* status, bool completed);
 
  public:
 
@@ -557,8 +561,12 @@ class Endpoint {
   std::vector<std::unique_ptr<ArLane>> ar_lanes_;
 
   /* Transfer-id ownership registry (see claim/release helpers). */
+  struct TransferEntry {
+    TransferStatus* status;
+    bool claimed;  // owned by an in-progress wait_async
+  };
   std::mutex transfer_status_mu_;
-  std::unordered_map<uint64_t, TransferStatus*> active_transfers_;
+  std::unordered_map<uint64_t, TransferEntry> active_transfers_;
 
 #if defined(__CAMBRICON_PLATFORM_MLU__)
 #include "mlu/mlu_staging.inc"  // Cambricon Plan A staging members/methods
