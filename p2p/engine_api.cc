@@ -937,6 +937,112 @@ NB_MODULE(p2p, m) {
           nb::arg("conn_id"), nb::arg("mr_id_v"), nb::arg("ptr_v"),
           nb::arg("size_v"), nb::arg("meta_blob_v"), nb::arg("num_iovs"))
       .def(
+          "write_all_async",
+          [](Endpoint& self, std::vector<uint64_t> conn_ids, uint64_t mr_id,
+             uint64_t ptr, size_t size, nb::list meta_blob_v) {
+            size_t const n = conn_ids.size();
+            if (nb::len(meta_blob_v) != n) {
+              throw std::runtime_error(
+                  "conn_ids and meta_blob_v must have the same length");
+            }
+            std::vector<FifoItem> item_v(n);
+            PyObject* meta_list_ptr = meta_blob_v.ptr();
+            for (size_t i = 0; i < n; ++i) {
+              char* bytes_data;
+              Py_ssize_t bytes_len;
+              if (PyBytes_AsStringAndSize(PyList_GetItem(meta_list_ptr, i),
+                                          &bytes_data, &bytes_len) != 0 ||
+                  bytes_len != sizeof(FifoItem)) {
+                throw std::runtime_error(
+                    "meta must be exactly 64 bytes (serialized FifoItem)");
+              }
+              deserialize_fifo_item(bytes_data, &item_v[i]);
+            }
+            uint64_t transfer_id;
+            bool ok;
+            {
+              nb::gil_scoped_release release;
+              InsidePythonGuard guard;
+              ok = self.write_all_async(conn_ids, mr_id,
+                                        reinterpret_cast<void*>(ptr), size,
+                                        item_v, &transfer_id);
+            }
+            return nb::make_tuple(ok, transfer_id);
+          },
+          "RDMA-WRITE the same local buffer to a list of conns in ONE call "
+          "(direct-post, doorbell-batched); returns (success, transfer_id); "
+          "`meta_blob_v` holds the per-conn 64-byte advertised FifoItems",
+          nb::arg("conn_ids"), nb::arg("mr_id"), nb::arg("ptr"),
+          nb::arg("size"), nb::arg("meta_blob_v"))
+      .def(
+          "wait_async",
+          [](Endpoint& self, uint64_t transfer_id, uint64_t timeout_us) {
+            bool ok;
+            {
+              nb::gil_scoped_release release;
+              InsidePythonGuard guard;
+              ok = self.wait_async(transfer_id, timeout_us);
+            }
+            return ok;
+          },
+          "C++-side wait for a transfer id (single or batched). Frees the "
+          "status on success — the id must not be reused. Returns False on "
+          "timeout (0 = wait forever).",
+          nb::arg("transfer_id"), nb::arg("timeout_us"))
+      .def(
+          "wait_flags",
+          [](Endpoint& self, std::vector<uint64_t> flag_addrs, int32_t seq,
+             uint64_t timeout_us) {
+            bool ok;
+            {
+              nb::gil_scoped_release release;
+              InsidePythonGuard guard;
+              ok = self.wait_flags(flag_addrs, seq, timeout_us);
+            }
+            return ok;
+          },
+          "C++-side spin until every pinned int32 flag word (given by raw "
+          "addresses) reaches seq. Returns False on timeout (0 = forever).",
+          nb::arg("flag_addrs"), nb::arg("seq"), nb::arg("timeout_us"))
+      .def(
+          "ar_lane_setup",
+          [](Endpoint& self, std::vector<uint64_t> conn_ids, uint64_t mr_id,
+             uint64_t ring_ptr, size_t stride, size_t num_slots,
+             uint64_t seq_ptr,
+             std::vector<std::vector<std::string>> item_blobs) {
+            if (item_blobs.size() != conn_ids.size()) {
+              throw std::runtime_error(
+                  "item_blobs must have one entry per conn_id");
+            }
+            uint64_t lane_id;
+            bool ok;
+            {
+              nb::gil_scoped_release release;
+              InsidePythonGuard guard;
+              ok = self.ar_lane_setup(conn_ids, mr_id, ring_ptr, stride,
+                                      num_slots, seq_ptr, item_blobs, &lane_id);
+            }
+            return nb::make_tuple(ok, lane_id);
+          },
+          "Set up an EP-style AR lane: a dedicated thread polls the pinned "
+          "seq word and posts one RDMA write per conn for each published "
+          "round (slot (seq-1) % num_slots of the send ring).",
+          nb::arg("conn_ids"), nb::arg("mr_id"), nb::arg("ring_ptr"),
+          nb::arg("stride"), nb::arg("num_slots"), nb::arg("seq_ptr"),
+          nb::arg("item_blobs"))
+      .def(
+          "ar_lane_stop",
+          [](Endpoint& self, uint64_t lane_id) {
+            bool ok;
+            {
+              nb::gil_scoped_release release;
+              InsidePythonGuard guard;
+              ok = self.ar_lane_stop(lane_id);
+            }
+            return ok;
+          },
+          "Stop an AR lane's posting thread.", nb::arg("lane_id"))
+      .def(
           "advertise",
           [](Endpoint& self, uint64_t mr_id,
              uint64_t ptr,  // raw pointer passed from Python

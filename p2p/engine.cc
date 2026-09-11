@@ -338,6 +338,15 @@ Endpoint::~Endpoint() {
 
   stop_.store(true, std::memory_order_release);
 
+  // Stop AR lanes first: their threads touch send groups and poll CQEs.
+  for (auto& lane : ar_lanes_) {
+    if (lane && lane->thread.joinable()) {
+      lane->stop.store(true, std::memory_order_release);
+      lane->thread.join();
+    }
+  }
+  ar_lanes_.clear();
+
   if (passive_accept_) {
     passive_accept_stop_.store(true, std::memory_order_release);
     if (passive_accept_thread_.joinable()) {
@@ -1271,6 +1280,295 @@ bool Endpoint::writev_async(uint64_t conn_id, std::vector<uint64_t> mr_id_v,
   send_proxy_adaptive_sleeper_.maybe_wake_proxy_thread();
 
   return true;
+}
+
+bool Endpoint::write_all_async(std::vector<uint64_t> const& conn_ids,
+                               uint64_t mr_id, void* src, size_t size,
+                               std::vector<FifoItem> const& slot_items,
+                               uint64_t* transfer_id) {
+  if (size > kDirectAsyncNetThreshold) {
+    std::cerr << "[write_all_async] size " << size
+              << " exceeds direct threshold " << kDirectAsyncNetThreshold
+              << std::endl;
+    return false;
+  }
+  size_t const n = conn_ids.size();
+  if (n == 0 || slot_items.size() != n) {
+    std::cerr << "[write_all_async] empty or mismatched conn/item lists"
+              << std::endl;
+    return false;
+  }
+  P2PMhandle* mhandle = get_mhandle(mr_id);
+  if (unlikely(mhandle == nullptr)) {
+    std::cerr << "[write_all_async] Error: Invalid mr_id " << mr_id
+              << std::endl;
+    return false;
+  }
+
+  auto* status = new TransferStatus();
+  status->poll_net_ureq_batch = true;
+  status->batch_ureqs.resize(n);
+  status->batch_pending.assign(n, true);
+  *transfer_id = reinterpret_cast<uint64_t>(status);
+
+  // Doorbell-batched posting: WRs accumulate per channel, flushed once below.
+  struct BatchGuard {
+    BatchGuard() { g_uccl_batch_post = true; }
+    ~BatchGuard() { g_uccl_batch_post = false; }
+  } batch_guard;
+
+  bool ok = true;
+  for (size_t i = 0; i < n; ++i) {
+    auto* conn = get_conn(conn_ids[i]);
+    if (unlikely(conn == nullptr)) {
+      std::cerr << "[write_all_async] Error: Invalid conn_id " << conn_ids[i]
+                << std::endl;
+      status->batch_pending[i] = false;
+      ok = false;
+      continue;
+    }
+    SendConnection* send_group =
+        uccl_resolve_send_group(ep_, conn->uccl_conn_id_.peer_id);
+    FifoItem curr_slot_item = slot_items[i];
+    curr_slot_item.size = static_cast<uint32_t>(size);
+    int rc;
+    do {
+      rc = send_group != nullptr
+               ? uccl_write_async_on_group(send_group, conn, mhandle, src, size,
+                                           curr_slot_item,
+                                           &status->batch_ureqs[i])
+               : uccl_write_async(ep_, conn, mhandle, src, size,
+                                  curr_slot_item, &status->batch_ureqs[i]);
+    } while (is_retryable_post_failure(rc));
+    if (rc < 0) {
+      UCCL_LOG(ERROR) << "[write_all_async] post failed for conn "
+                      << conn_ids[i] << ": rc=" << rc;
+      status->batch_pending[i] = false;
+      ok = false;
+    }
+  }
+
+  uccl_flush_send(ep_);
+  uccl_drive_send(ep_);
+  return ok;
+}
+
+bool Endpoint::wait_async(uint64_t transfer_id, uint64_t timeout_us) {
+  auto* status = reinterpret_cast<TransferStatus*>(transfer_id);
+  auto const deadline =
+      timeout_us == 0
+          ? std::chrono::steady_clock::time_point::max()
+          : std::chrono::steady_clock::now() +
+                std::chrono::microseconds(timeout_us);
+  while (!status->done.load(std::memory_order_acquire)) {
+    bool all_done = true;
+    if (status->poll_net_ureq_batch) {
+      uccl_drive_send(ep_);
+      for (size_t i = 0; i < status->batch_ureqs.size(); ++i) {
+        if (status->batch_pending[i] &&
+            uccl_check_ureq_once(ep_, &status->batch_ureqs[i])) {
+          status->batch_pending[i] = false;
+        }
+        if (status->batch_pending[i]) all_done = false;
+      }
+    } else if (status->poll_net_ureq) {
+      if (!uccl_poll_ureq_once(ep_, &status->ureq)) all_done = false;
+    }
+    if (all_done) break;
+    auto _ = inside_python ? (check_python_signals(), nullptr) : nullptr;
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return false;
+    }
+    std::this_thread::yield();
+  }
+  status->done.store(true, std::memory_order_release);
+  delete status;
+  return true;
+}
+
+bool Endpoint::wait_flags(std::vector<uint64_t> const& flag_addrs, int32_t seq,
+                          uint64_t timeout_us) {
+  if (flag_addrs.empty()) return true;
+  auto const deadline =
+      timeout_us == 0
+          ? std::chrono::steady_clock::time_point::max()
+          : std::chrono::steady_clock::now() +
+                std::chrono::microseconds(timeout_us);
+  size_t const n = flag_addrs.size();
+  while (true) {
+    bool all_ready = true;
+    for (size_t i = 0; i < n; ++i) {
+      auto* flag = reinterpret_cast<int32_t volatile*>(flag_addrs[i]);
+      if (__atomic_load_n(flag, __ATOMIC_ACQUIRE) < seq) {
+        all_ready = false;
+        break;
+      }
+    }
+    if (all_ready) return true;
+    auto _ = inside_python ? (check_python_signals(), nullptr) : nullptr;
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return false;
+    }
+    std::this_thread::yield();
+  }
+}
+
+bool Endpoint::ar_lane_setup(
+    std::vector<uint64_t> const& conn_ids, uint64_t mr_id,
+    uint64_t send_ring_ptr, size_t stride, size_t num_slots, uint64_t seq_ptr,
+    std::vector<std::vector<std::string>> const& item_blobs,
+    uint64_t& lane_id) {
+  if (num_slots == 0 || stride == 0 ||
+      item_blobs.size() != conn_ids.size() || conn_ids.empty()) {
+    std::cerr << "[ar_lane_setup] invalid arguments" << std::endl;
+    return false;
+  }
+  P2PMhandle* mhandle = get_mhandle(mr_id);
+  if (unlikely(mhandle == nullptr)) {
+    std::cerr << "[ar_lane_setup] Error: Invalid mr_id " << mr_id << std::endl;
+    return false;
+  }
+
+  auto lane = std::make_unique<ArLane>();
+  lane->mhandle = mhandle;
+  lane->ring_base = reinterpret_cast<void*>(send_ring_ptr);
+  lane->stride = stride;
+  lane->num_slots = num_slots;
+  lane->seq_word = reinterpret_cast<int32_t*>(seq_ptr);
+  lane->peers.resize(conn_ids.size());
+  for (size_t i = 0; i < conn_ids.size(); ++i) {
+    auto* conn = get_conn(conn_ids[i]);
+    if (unlikely(conn == nullptr)) {
+      std::cerr << "[ar_lane_setup] Error: Invalid conn_id " << conn_ids[i]
+                << std::endl;
+      return false;
+    }
+    auto& pc = lane->peers[i];
+    pc.conn = conn;
+    // Channel setup may race a fresh connect(); retry briefly.
+    for (int attempt = 0;; ++attempt) {
+      pc.send_group = uccl_resolve_send_group(ep_, conn->uccl_conn_id_.peer_id);
+      if (pc.send_group != nullptr || attempt >= 2000) break;
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    if (pc.send_group == nullptr) {
+      std::cerr << "[ar_lane_setup] send group not found for peer_id "
+                << conn->uccl_conn_id_.peer_id << std::endl;
+      return false;
+    }
+    pc.items.resize(num_slots);
+    pc.ureqs.resize(num_slots);
+    pc.slot_inflight.assign(num_slots, false);
+    if (item_blobs[i].size() != num_slots) {
+      std::cerr << "[ar_lane_setup] peer " << i << ": expected " << num_slots
+                << " item blobs, got " << item_blobs[i].size() << std::endl;
+      return false;
+    }
+    for (size_t k = 0; k < num_slots; ++k) {
+      if (item_blobs[i][k].size() != sizeof(FifoItem)) {
+        std::cerr << "[ar_lane_setup] item blob must be exactly "
+                  << sizeof(FifoItem) << " bytes" << std::endl;
+        return false;
+      }
+      deserialize_fifo_item(item_blobs[i][k].data(), &pc.items[k]);
+      pc.items[k].size = static_cast<uint32_t>(stride);
+    }
+  }
+
+  lane_id = ar_lanes_.size();
+  ar_lanes_.push_back(std::move(lane));
+  ArLane* l = ar_lanes_.back().get();
+  l->thread = std::thread(&Endpoint::ar_lane_thread_func, this, l);
+  return true;
+}
+
+bool Endpoint::ar_lane_stop(uint64_t lane_id) {
+  if (lane_id >= ar_lanes_.size() || ar_lanes_[lane_id] == nullptr) {
+    return false;
+  }
+  auto* lane = ar_lanes_[lane_id].get();
+  if (lane->thread.joinable()) {
+    lane->stop.store(true, std::memory_order_release);
+    lane->thread.join();
+  }
+  return true;
+}
+
+void Endpoint::ar_lane_thread_func(ArLane* lane) {
+  uccl::pin_thread_to_numa(numa_node_);
+  int32_t* seq_word = lane->seq_word;
+  uint64_t idle_spins = 0;
+  while (!lane->stop.load(std::memory_order_acquire)) {
+    int32_t const seq = __atomic_load_n(seq_word, __ATOMIC_ACQUIRE);
+    if (seq <= lane->last_seq) {
+      // Reap local CQEs so slots become reusable; spin with yield hint.
+      bool reaped = false;
+      for (auto& pc : lane->peers) {
+        for (size_t k = 0; k < lane->num_slots; ++k) {
+          if (pc.slot_inflight[k] &&
+              uccl_check_wr_fast(pc.send_group, pc.ureqs[k].engine_idx)) {
+            pc.slot_inflight[k] = false;
+            reaped = true;
+          }
+        }
+      }
+      if (!reaped && (++idle_spins & 63) == 0) {
+        std::this_thread::yield();
+      }
+      continue;
+    }
+    idle_spins = 0;
+    // Post rounds in order up to the published seq.
+    while (lane->last_seq < seq &&
+           !lane->stop.load(std::memory_order_acquire)) {
+      int32_t const target = lane->last_seq + 1;
+      size_t const slot =
+          (static_cast<size_t>(target - 1)) % lane->num_slots;
+      // Re-posting a WR template requires the prior post of that slot to be
+      // locally acked. If still inflight, drive the poller and retry the
+      // outer loop (the producer is seq-gated, so this is rare).
+      bool blocked = false;
+      for (auto& pc : lane->peers) {
+        if (pc.slot_inflight[slot] &&
+            !uccl_check_wr_fast(pc.send_group, pc.ureqs[slot].engine_idx)) {
+          blocked = true;
+          break;
+        }
+      }
+      if (blocked) {
+        uccl_drive_send(ep_);
+        std::this_thread::yield();
+        break;
+      }
+      {
+        struct BatchGuard {
+          BatchGuard() { g_uccl_batch_post = true; }
+          ~BatchGuard() { g_uccl_batch_post = false; }
+        } batch_guard;
+        void* src =
+            static_cast<char*>(lane->ring_base) + slot * lane->stride;
+        for (auto& pc : lane->peers) {
+          UcclRequest ureq{};
+          int rc;
+          do {
+            rc = uccl_write_async_on_group(pc.send_group, pc.conn,
+                                           lane->mhandle, src, lane->stride,
+                                           pc.items[slot], &ureq);
+          } while (is_retryable_post_failure(rc));
+          if (rc < 0) {
+            UCCL_LOG(ERROR) << "[ar_lane] post failed for slot " << slot
+                            << ": rc=" << rc;
+            continue;
+          }
+          pc.ureqs[slot] = ureq;
+          pc.slot_inflight[slot] = true;
+        }
+      }
+      uccl_flush_send(ep_);
+      uccl_drive_send(ep_);
+      lane->last_seq = target;
+    }
+  }
 }
 
 bool Endpoint::advertise(uint64_t mr_id, void* addr, size_t len,
@@ -2266,6 +2564,19 @@ bool Endpoint::start_passive_accept() {
 
 bool Endpoint::poll_async(uint64_t transfer_id, bool* is_done) {
   auto* status = reinterpret_cast<TransferStatus*>(transfer_id);
+  if (status->poll_net_ureq_batch &&
+      !status->done.load(std::memory_order_acquire)) {
+    uccl_drive_send(ep_);
+    bool all_done = true;
+    for (size_t i = 0; i < status->batch_ureqs.size(); ++i) {
+      if (status->batch_pending[i] &&
+          uccl_check_ureq_once(ep_, &status->batch_ureqs[i])) {
+        status->batch_pending[i] = false;
+      }
+      if (status->batch_pending[i]) all_done = false;
+    }
+    if (all_done) status->done.store(true, std::memory_order_release);
+  }
   if (status->poll_net_ureq && !status->done.load(std::memory_order_acquire)) {
     if (uccl_poll_ureq_once(ep_, &status->ureq)) {
       status->done.store(true, std::memory_order_release);

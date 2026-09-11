@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -176,6 +177,10 @@ struct TransferStatus {
   std::shared_ptr<UnifiedTask> task_ptr;
   bool poll_net_ureq{false};
   UcclRequest ureq{};
+  // Batch variant (write_all_async): several net ureqs polled as one id.
+  bool poll_net_ureq_batch{false};
+  std::vector<UcclRequest> batch_ureqs;
+  std::vector<bool> batch_pending;
 };
 
 struct alignas(64) UnifiedTask {
@@ -234,6 +239,32 @@ struct IpcInflightOp {
   // Vectorized only (populated when raw_ptr == nullptr):
   std::vector<void*> raw_ptrs_v;
   std::vector<int> gpu_idxs_v;
+};
+
+// EP-style AR lane (pattern from uccl/ep's D2H queue + proxy): the producer
+// lays [data | 4B seq flag] into the lane's send-ring slot, then stores the
+// round seq into a producer-owned pinned seq word. A dedicated thread polls
+// the seq word and posts one pre-resolved RDMA write per peer through the
+// engine's existing submit path (doorbell-batched), with no per-round lookups
+// or app-visible posting latency. Receiver-side visibility remains the
+// peers' flag-in-slot protocol — the lane's CQEs only gate slot reuse.
+struct ArLane {
+  struct PeerCtx {
+    Conn* conn = nullptr;
+    SendConnection* send_group = nullptr;
+    std::vector<FifoItem> items;      // per slot: peer's advertised inbox slot
+    std::vector<UcclRequest> ureqs;   // per slot (last posted request)
+    std::vector<bool> slot_inflight;  // per slot: posted, awaiting local CQE
+  };
+  std::vector<PeerCtx> peers;
+  P2PMhandle* mhandle = nullptr;
+  void* ring_base = nullptr;  // num_slots x stride bytes, [data | seq flag]
+  size_t stride = 0;
+  size_t num_slots = 0;
+  int32_t* seq_word = nullptr;  // producer-owned pinned word
+  int32_t last_seq = 0;
+  std::atomic<bool> stop{false};
+  std::thread thread;
 };
 
 // -----------------------------------------------------------------------------
@@ -342,6 +373,48 @@ class Endpoint {
                     std::vector<void*> src_v, std::vector<size_t> size_v,
                     std::vector<FifoItem> slot_item_v, size_t num_iovs,
                     uint64_t* transfer_id);
+
+  /* Fast batch write: post ONE WR per conn from the caller thread (direct
+   * path; every size must be <= kDirectAsyncNetThreshold), doorbell-batched,
+   * returning a single combined transfer id. src is shared by all conns
+   * (each conn gets its own advertised slot item). */
+  bool write_all_async(std::vector<uint64_t> const& conn_ids, uint64_t mr_id,
+                       void* src, size_t size,
+                       std::vector<FifoItem> const& slot_items,
+                       uint64_t* transfer_id);
+
+  /* C++-side wait for a transfer id (write_async/writev_async/
+   * write_all_async). Blocks until every outstanding request completes or
+   * timeout_us elapses (0 = wait forever). The status is freed on success —
+   * the id must not be reused afterwards. */
+  bool wait_async(uint64_t transfer_id, uint64_t timeout_us);
+
+  /* C++-side spin on pinned flag words: returns true when every address
+   * (int32 words in RDMA-registered pinned memory) has reached seq, false on
+   * timeout (0 = wait forever). */
+  bool wait_flags(std::vector<uint64_t> const& flag_addrs, int32_t seq,
+                  uint64_t timeout_us);
+
+  /* AR lane: EP-style doorbell lane. conn_ids: outbound connect() conns, one
+   * per peer. send_ring_ptr: pinned, RDMA-registered (mr_id) buffer of
+   * num_slots x stride bytes, each slot laid out [data | 4B seq flag].
+   * seq_ptr: pinned int32 word the producer stores the round seq into; slot
+   * (seq-1) % num_slots is posted. item_blobs[i][k]: the 64-byte advertised
+   * FifoItem blobs for peer i, slot k (peer's inbox slot for this rank). */
+  bool ar_lane_setup(std::vector<uint64_t> const& conn_ids, uint64_t mr_id,
+                     uint64_t send_ring_ptr, size_t stride, size_t num_slots,
+                     uint64_t seq_ptr,
+                     std::vector<std::vector<std::string>> const& item_blobs,
+                     uint64_t& lane_id);
+
+  /* Stop a lane's posting thread (blocks until it exits). */
+  bool ar_lane_stop(uint64_t lane_id);
+
+ private:
+  /* AR lane posting loop (runs on the lane's dedicated thread). */
+  void ar_lane_thread_func(ArLane* lane);
+
+ public:
 
   /* Advertise a data chunk for remote side to write/read */
   bool advertise(uint64_t mr_id, void* addr, size_t len, char* out_buf);
@@ -456,6 +529,10 @@ class Endpoint {
   P2PAdaptiveSleeper send_proxy_adaptive_sleeper_;
   P2PAdaptiveSleeper recv_proxy_adaptive_sleeper_;
   P2PAdaptiveSleeper ipc_proxy_adaptive_sleeper_;
+
+  /* EP-style AR lanes (ar_lane_setup); threads joined before engine teardown
+   * in ~Endpoint. */
+  std::vector<std::unique_ptr<ArLane>> ar_lanes_;
 
 #if defined(__CAMBRICON_PLATFORM_MLU__)
 #include "mlu/mlu_staging.inc"  // Cambricon Plan A staging members/methods
