@@ -812,7 +812,7 @@ bool Endpoint::read_async(uint64_t conn_id, uint64_t mr_id, void* dst,
     auto* status = new TransferStatus();
     status->poll_net_ureq = true;
     status->ureq = ureq;
-    *transfer_id = reinterpret_cast<uint64_t>(status);
+    *transfer_id = register_transfer(status);
     return true;
   }
 
@@ -825,7 +825,7 @@ bool Endpoint::read_async(uint64_t conn_id, uint64_t mr_id, void* dst,
   auto* status = new TransferStatus();
   status->task_ptr = task_ptr;
   task_ptr->status_ptr = status;
-  *transfer_id = reinterpret_cast<uint64_t>(status);
+  *transfer_id = register_transfer(status);
 
   UnifiedTask* task_raw = task_ptr.get();
 
@@ -967,7 +967,7 @@ bool Endpoint::readv_async(uint64_t conn_id, std::vector<uint64_t> mr_id_v,
   auto* status = new TransferStatus();
   status->task_ptr = task_ptr;
   task_ptr->status_ptr = status;
-  *transfer_id = reinterpret_cast<uint64_t>(status);
+  *transfer_id = register_transfer(status);
 
   UnifiedTask* task_raw = task_ptr.get();
 
@@ -1139,7 +1139,7 @@ bool Endpoint::write_async(uint64_t conn_id, uint64_t mr_id, void* src,
     auto* status = new TransferStatus();
     status->poll_net_ureq = true;
     status->ureq = ureq;
-    *transfer_id = reinterpret_cast<uint64_t>(status);
+    *transfer_id = register_transfer(status);
     return true;
   }
 
@@ -1152,7 +1152,7 @@ bool Endpoint::write_async(uint64_t conn_id, uint64_t mr_id, void* src,
   auto* status = new TransferStatus();
   status->task_ptr = task_ptr;
   task_ptr->status_ptr = status;
-  *transfer_id = reinterpret_cast<uint64_t>(status);
+  *transfer_id = register_transfer(status);
 
   UnifiedTask* task_raw = task_ptr.get();
 
@@ -1295,7 +1295,7 @@ bool Endpoint::writev_async(uint64_t conn_id, std::vector<uint64_t> mr_id_v,
   auto* status = new TransferStatus();
   status->task_ptr = task_ptr;
   task_ptr->status_ptr = status;
-  *transfer_id = reinterpret_cast<uint64_t>(status);
+  *transfer_id = register_transfer(status);
 
   UnifiedTask* task_raw = task_ptr.get();
 
@@ -1335,7 +1335,7 @@ bool Endpoint::write_all_async(std::vector<uint64_t> const& conn_ids,
   status->poll_net_ureq_batch = true;
   status->batch_ureqs.resize(n);
   status->batch_pending.assign(n, true);
-  *transfer_id = reinterpret_cast<uint64_t>(status);
+  *transfer_id = register_transfer(status);
 
   // Doorbell-batched posting: WRs accumulate per channel, flushed once below.
   BatchGuard batch_guard;
@@ -1377,19 +1377,20 @@ bool Endpoint::write_all_async(std::vector<uint64_t> const& conn_ids,
 }
 
 bool Endpoint::wait_async(uint64_t transfer_id, uint64_t timeout_us) {
-  auto* status = reinterpret_cast<TransferStatus*>(transfer_id);
+  TransferStatus* status = nullptr;
+  if (!claim_transfer(transfer_id, &status)) {
+    // Unknown/stale id: either already freed by another waiter (it reported
+    // done) or never handed out. Report completion without touching memory.
+    return true;
+  }
   auto const deadline =
       timeout_us == 0
           ? std::chrono::steady_clock::time_point::max()
           : std::chrono::steady_clock::now() +
                 std::chrono::microseconds(timeout_us);
   uint64_t spin = 0;
+  bool timed_out = false;
   while (true) {
-    // Single-owner reclamation: if another thread already freed this status,
-    // bail out without touching it again.
-    if (status->reclaimed.load(std::memory_order_acquire)) {
-      return status->done.load(std::memory_order_acquire);
-    }
     if (status->poll_net_ureq_batch) {
       if (poll_batch_ureqs(ep_, status)) break;
     } else if (status->poll_net_ureq) {
@@ -1406,15 +1407,16 @@ bool Endpoint::wait_async(uint64_t transfer_id, uint64_t timeout_us) {
       check_python_signals();
     }
     if (std::chrono::steady_clock::now() >= deadline) {
-      return false;
+      timed_out = true;
+      break;
     }
     std::this_thread::yield();
   }
-  status->done.store(true, std::memory_order_release);
-  if (status->reclaimed.exchange(true, std::memory_order_acq_rel)) {
-    // Another thread freed it concurrently — do not touch.
-    return true;
+  if (timed_out) {
+    release_transfer(transfer_id, status);
+    return false;
   }
+  status->done.store(true, std::memory_order_release);
   delete status;
   return true;
 }
@@ -1449,6 +1451,27 @@ bool Endpoint::wait_flags(std::vector<uint64_t> const& flag_addrs, int32_t seq,
   }
 }
 
+uint64_t Endpoint::register_transfer(TransferStatus* status) {
+  std::lock_guard<std::mutex> lock(transfer_status_mu_);
+  uint64_t const id = reinterpret_cast<uint64_t>(status);
+  active_transfers_[id] = status;
+  return id;
+}
+
+bool Endpoint::claim_transfer(uint64_t transfer_id, TransferStatus** out) {
+  std::lock_guard<std::mutex> lock(transfer_status_mu_);
+  auto it = active_transfers_.find(transfer_id);
+  if (it == active_transfers_.end()) return false;
+  *out = it->second;
+  active_transfers_.erase(it);
+  return true;
+}
+
+void Endpoint::release_transfer(uint64_t transfer_id, TransferStatus* status) {
+  std::lock_guard<std::mutex> lock(transfer_status_mu_);
+  active_transfers_[transfer_id] = status;
+}
+
 bool Endpoint::ar_lane_setup(
     std::vector<uint64_t> const& conn_ids, uint64_t mr_id,
     uint64_t send_ring_ptr, size_t stride, size_t num_slots, uint64_t seq_ptr,
@@ -1480,9 +1503,12 @@ bool Endpoint::ar_lane_setup(
     auto const* begin = static_cast<uint8_t const*>(mr->data_);
     auto const* end = begin + mr->size_;
     auto const* r = static_cast<uint8_t const*>(ring_base);
-    if (r < begin || r + num_slots * stride > end) {
+    if (r < begin || r > end ||
+        num_slots > static_cast<size_t>(end - r) / stride) {
+      // Division form: avoids overflow in num_slots * stride.
       std::cerr << "[ar_lane_setup] ring [" << static_cast<void const*>(r)
-                << ", " << static_cast<void const*>(r + num_slots * stride)
+                << ", "
+                << static_cast<void const*>(r + num_slots * stride)
                 << ") is outside registered mr_id " << mr_id << std::endl;
       return false;
     }
@@ -1629,11 +1655,15 @@ void Endpoint::ar_lane_thread_func(ArLane* lane) {
             if (pc.posted_seq >= target) continue;
             UcclRequest ureq{};
             int rc;
+            // Bounded repost: exit on lane stop so ar_lane_stop()/teardown
+            // joins promptly even when a peer's queue is persistently full
+            // (e.g. the peer being removed is exactly why it is stuck).
             do {
               rc = uccl_write_async_on_group(pc.send_group, pc.conn,
                                              lane->mhandle, src, lane->stride,
                                              pc.items[slot], &ureq);
-            } while (is_retryable_post_failure(rc));
+            } while (is_retryable_post_failure(rc) &&
+                     !lane->stop.load(std::memory_order_acquire));
             if (rc < 0) {
               failed = true;
               break;
@@ -2212,7 +2242,7 @@ bool Endpoint::write_ipc_async(uint64_t conn_id, void const* data, size_t size,
 
   auto* status = new TransferStatus();
   op->status = status;
-  *transfer_id = reinterpret_cast<uint64_t>(status);
+  *transfer_id = register_transfer(status);
 
   while (jring_mp_enqueue_bulk(ipc_inflight_ring_, &op, 1, nullptr) != 1) {
   }
@@ -2286,7 +2316,7 @@ bool Endpoint::read_ipc_async(uint64_t conn_id, void* data, size_t size,
 
   auto* status = new TransferStatus();
   op->status = status;
-  *transfer_id = reinterpret_cast<uint64_t>(status);
+  *transfer_id = register_transfer(status);
 
   while (jring_mp_enqueue_bulk(ipc_inflight_ring_, &op, 1, nullptr) != 1) {
   }
@@ -2377,7 +2407,7 @@ bool Endpoint::writev_ipc_async(uint64_t conn_id,
 
   auto* status = new TransferStatus();
   op->status = status;
-  *transfer_id = reinterpret_cast<uint64_t>(status);
+  *transfer_id = register_transfer(status);
 
   while (jring_mp_enqueue_bulk(ipc_inflight_ring_, &op, 1, nullptr) != 1) {
   }
@@ -2467,7 +2497,7 @@ bool Endpoint::readv_ipc_async(uint64_t conn_id, std::vector<void*> data_v,
 
   auto* status = new TransferStatus();
   op->status = status;
-  *transfer_id = reinterpret_cast<uint64_t>(status);
+  *transfer_id = register_transfer(status);
 
   while (jring_mp_enqueue_bulk(ipc_inflight_ring_, &op, 1, nullptr) != 1) {
   }
@@ -2607,8 +2637,32 @@ bool Endpoint::add_remote_endpoint(std::vector<uint8_t> const& metadata,
 }
 
 bool Endpoint::remove_remote_endpoint(uint64_t conn_id) {
-  std::unique_lock<std::shared_mutex> lock(conn_mu_);
+  // Peek under the lock, then release it before stopping lanes: stop_lanes_
+  // joins lane threads, and a lane can be slow exactly when its peer is
+  // being removed — holding conn_mu_ through the join would deadlock every
+  // other conn operation engine-wide.
+  uint64_t loopback_conn_id = UINT64_MAX;
+  {
+    std::shared_lock<std::shared_mutex> lock(conn_mu_);
+    auto it = conn_id_to_conn_.find(conn_id);
+    if (it == conn_id_to_conn_.end()) {
+      std::cerr << "[remove_remote_endpoint] Error: Invalid conn_id "
+                << conn_id << std::endl;
+      return false;
+    }
+    loopback_conn_id = it->second->rdma_loopback_conn_id_;
+  }
 
+  // Lanes hold raw Conn*/SendConnection* for their peers; stop any lane that
+  // uses this conn (or its loopback) before the objects are freed.
+  stop_lanes_for_conn(conn_id);
+  if (loopback_conn_id != UINT64_MAX) {
+    stop_lanes_for_conn(loopback_conn_id);
+  }
+
+  // Re-acquire and actually remove. Another thread may have removed the conn
+  // in between; the re-find handles that.
+  std::unique_lock<std::shared_mutex> lock(conn_mu_);
   auto it = conn_id_to_conn_.find(conn_id);
   if (it == conn_id_to_conn_.end()) {
     std::cerr << "[remove_remote_endpoint] Error: Invalid conn_id " << conn_id
@@ -2617,11 +2671,6 @@ bool Endpoint::remove_remote_endpoint(uint64_t conn_id) {
   }
 
   Conn* conn = it->second;
-  uint64_t loopback_conn_id = conn->rdma_loopback_conn_id_;
-
-  // Lanes hold raw Conn*/SendConnection* for their peers; stop any lane that
-  // uses this conn (or its loopback) before the objects are freed.
-  stop_lanes_for_conn(conn_id);
 
   // Detach shared memory if this was a local connection
   if (conn->shm_attached_) {
@@ -2642,7 +2691,6 @@ bool Endpoint::remove_remote_endpoint(uint64_t conn_id) {
   conn_id_to_conn_.erase(it);
 
   if (loopback_conn_id != UINT64_MAX) {
-    stop_lanes_for_conn(loopback_conn_id);
     auto loopback_it = conn_id_to_conn_.find(loopback_conn_id);
     if (loopback_it != conn_id_to_conn_.end()) {
       Conn* loopback_conn = loopback_it->second;
@@ -2671,10 +2719,11 @@ bool Endpoint::start_passive_accept() {
 }
 
 bool Endpoint::poll_async(uint64_t transfer_id, bool* is_done) {
-  auto* status = reinterpret_cast<TransferStatus*>(transfer_id);
-  if (status->reclaimed.load(std::memory_order_acquire)) {
-    // Already freed by wait_async (or another poller) — report done state
-    // without touching the object further.
+  TransferStatus* status = nullptr;
+  if (!claim_transfer(transfer_id, &status)) {
+    // Unknown/stale id: already freed by wait_async/poll_async (which only
+    // frees on completion) or never handed out. Report done without touching
+    // possibly-freed memory.
     *is_done = true;
     return true;
   }
@@ -2691,11 +2740,9 @@ bool Endpoint::poll_async(uint64_t transfer_id, bool* is_done) {
   }
   *is_done = status->done.load(std::memory_order_acquire);
   if (*is_done) {
-    if (status->reclaimed.exchange(true, std::memory_order_acq_rel)) {
-      // Another thread freed it concurrently — do not touch.
-      return true;
-    }
     delete status;
+  } else {
+    release_transfer(transfer_id, status);
   }
   return true;
 }

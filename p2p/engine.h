@@ -177,9 +177,6 @@ struct UnifiedTask;
 
 struct TransferStatus {
   std::atomic<bool> done{false};
-  // Single-owner reclamation: the first thread to observe `done` CASes this
-  // and frees the status; the other must bail out without touching it.
-  std::atomic<bool> reclaimed{false};
   std::shared_ptr<UnifiedTask> task_ptr;
   bool poll_net_ureq{false};
   UcclRequest ureq{};
@@ -428,6 +425,15 @@ class Endpoint {
   bool stop_lanes_for_conn(uint64_t conn_id);
   bool stop_lanes_for_mr(uint64_t mr_id);
 
+  /* Out-of-band ownership for transfer ids (transfer_id -> TransferStatus).
+   * poll_async/wait_async CLAIM an id by erasing it from the map under the
+   * lock — from then on no other thread can reach the object through the
+   * id — and release it back if not done, so an unknown/stale id is seen
+   * without touching possibly-freed memory. */
+  uint64_t register_transfer(TransferStatus* status);
+  bool claim_transfer(uint64_t transfer_id, TransferStatus** out);
+  void release_transfer(uint64_t transfer_id, TransferStatus* status);
+
  public:
 
   /* Advertise a data chunk for remote side to write/read */
@@ -549,6 +555,10 @@ class Endpoint {
    * multiple Python threads may touch the vector). */
   std::mutex ar_lanes_mu_;
   std::vector<std::unique_ptr<ArLane>> ar_lanes_;
+
+  /* Transfer-id ownership registry (see claim/release helpers). */
+  std::mutex transfer_status_mu_;
+  std::unordered_map<uint64_t, TransferStatus*> active_transfers_;
 
 #if defined(__CAMBRICON_PLATFORM_MLU__)
 #include "mlu/mlu_staging.inc"  // Cambricon Plan A staging members/methods
