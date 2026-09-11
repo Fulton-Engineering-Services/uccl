@@ -1020,7 +1020,7 @@ NB_MODULE(p2p, m) {
               nb::gil_scoped_release release;
               InsidePythonGuard guard;
               ok = self.ar_lane_setup(conn_ids, mr_id, ring_ptr, stride,
-                                      num_slots, seq_ptr, item_blobs, &lane_id);
+                                      num_slots, seq_ptr, item_blobs, lane_id);
             }
             return nb::make_tuple(ok, lane_id);
           },
