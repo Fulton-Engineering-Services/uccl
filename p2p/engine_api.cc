@@ -958,7 +958,7 @@ NB_MODULE(p2p, m) {
               }
               deserialize_fifo_item(bytes_data, &item_v[i]);
             }
-            uint64_t transfer_id;
+            uint64_t transfer_id = 0;
             bool ok;
             {
               nb::gil_scoped_release release;

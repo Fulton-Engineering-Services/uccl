@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -57,6 +58,8 @@ struct P2PMhandle {
 struct MR {
   uint64_t mr_id_;
   P2PMhandle* mhandle_;
+  void const* data_ = nullptr;  // registered span, for ar_lane validation
+  size_t size_ = 0;
 };
 
 struct ShmRingHandle {
@@ -174,6 +177,9 @@ struct UnifiedTask;
 
 struct TransferStatus {
   std::atomic<bool> done{false};
+  // Single-owner reclamation: the first thread to observe `done` CASes this
+  // and frees the status; the other must bail out without touching it.
+  std::atomic<bool> reclaimed{false};
   std::shared_ptr<UnifiedTask> task_ptr;
   bool poll_net_ureq{false};
   UcclRequest ureq{};
@@ -250,14 +256,17 @@ struct IpcInflightOp {
 // peers' flag-in-slot protocol — the lane's CQEs only gate slot reuse.
 struct ArLane {
   struct PeerCtx {
+    uint64_t conn_id = 0;
     Conn* conn = nullptr;
     SendConnection* send_group = nullptr;
     std::vector<FifoItem> items;      // per slot: peer's advertised inbox slot
     std::vector<UcclRequest> ureqs;   // per slot (last posted request)
     std::vector<bool> slot_inflight;  // per slot: posted, awaiting local CQE
+    int32_t posted_seq = 0;           // last seq successfully posted
   };
   std::vector<PeerCtx> peers;
   P2PMhandle* mhandle = nullptr;
+  uint64_t mr_id = 0;  // for lifetime coordination with dereg()
   void* ring_base = nullptr;  // num_slots x stride bytes, [data | seq flag]
   size_t stride = 0;
   size_t num_slots = 0;
@@ -413,6 +422,11 @@ class Endpoint {
  private:
   /* AR lane posting loop (runs on the lane's dedicated thread). */
   void ar_lane_thread_func(ArLane* lane);
+  /* Stop and join every lane whose peers/mr reference the given id; returns
+   * whether any lane was stopped. Used to enforce teardown ordering before
+   * remove_remote_endpoint()/dereg() free conns/mhandles. */
+  bool stop_lanes_for_conn(uint64_t conn_id);
+  bool stop_lanes_for_mr(uint64_t mr_id);
 
  public:
 
@@ -531,7 +545,9 @@ class Endpoint {
   P2PAdaptiveSleeper ipc_proxy_adaptive_sleeper_;
 
   /* EP-style AR lanes (ar_lane_setup); threads joined before engine teardown
-   * in ~Endpoint. */
+   * in ~Endpoint. Guarded by ar_lanes_mu_ (bindings release the GIL, so
+   * multiple Python threads may touch the vector). */
+  std::mutex ar_lanes_mu_;
   std::vector<std::unique_ptr<ArLane>> ar_lanes_;
 
 #if defined(__CAMBRICON_PLATFORM_MLU__)

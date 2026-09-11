@@ -1247,6 +1247,12 @@ void combine(void* combined_x, void* rdma_recv_x, int* rdma_recv_flag,
   int num_warp_groups = ceil_div(num_experts, num_device_sms);
   int num_warps_per_group = kNumMaxWarpGroups / num_warp_groups;
   if (num_warp_groups * num_warps_per_group < num_topk + 1) {
+    // On low-SM devices (e.g. GB10 with 48 SMs) and large expert counts,
+    // ceil_div produces too few warp groups to satisfy num_topk+1 warps.
+    // Pick 15, the largest value keeping num_warps_per_group > 1 and within
+    // the combine kernel's device-side assertion (< 16). NOTE: dispatch's
+    // fallback is intentionally 14, not 15 — its device assert is < 15.
+    // Do not "unify" these two constants.
     num_warp_groups = 15;
     num_warps_per_group = kNumMaxWarpGroups / num_warp_groups;
   }

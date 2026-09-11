@@ -160,6 +160,14 @@ def test_worker(
 ):
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
 
+    # num_experts is EXPERTS PER RANK so the expert→rank mapping is valid by
+    # construction for any launch size (e.g. 3/rank × 2 ranks = 6 total,
+    # num_local_experts = 3). An odd total would map experts to nonexistent
+    # ranks; also num_topk must not exceed the total.
+    num_experts = num_experts * num_ranks
+    assert num_experts % num_ranks == 0, "experts-per-rank must divide evenly"
+    assert num_topk <= num_experts, "num_topk cannot exceed num_experts"
+
     try:
         test_simple_internode(
             rank,
@@ -182,7 +190,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--hidden", type=int, default=2048, help="Hidden dimension")
     parser.add_argument(
-        "--num-experts", type=int, default=3, help="Number of experts (total)"
+        "--num-experts",
+        type=int,
+        default=3,
+        help="Number of experts PER RANK (total = this x num_ranks)",
     )
     parser.add_argument(
         "--num-topk", type=int, default=4, help="Top-k experts per token"

@@ -125,6 +125,30 @@ static inline void check_python_signals() {
   PyGILState_Release(gstate);
 }
 
+// Doorbell-batched posting: all submit_request() calls from this thread
+// accumulate WRs per channel; flush with uccl_flush_send(). Saves and
+// restores the previous thread-local value.
+struct BatchGuard {
+  bool prev;
+  BatchGuard() : prev(g_uccl_batch_post) { g_uccl_batch_post = true; }
+  ~BatchGuard() { g_uccl_batch_post = prev; }
+};
+
+// Poll the batch ureqs of a write_all_async status once (drives the send
+// poller first). Shared by wait_async() and poll_async().
+inline bool poll_batch_ureqs(GenericEndpoint const& ep, TransferStatus* status) {
+  uccl_drive_send(ep);
+  bool all_done = true;
+  for (size_t i = 0; i < status->batch_ureqs.size(); ++i) {
+    if (status->batch_pending[i] &&
+        uccl_check_ureq_once(ep, &status->batch_ureqs[i])) {
+      status->batch_pending[i] = false;
+    }
+    if (status->batch_pending[i]) all_done = false;
+  }
+  return all_done;
+}
+
 static inline bool is_retryable_post_failure(int rc) {
   if (is_cxi_transport()) return rc == UCCL_POST_TRANSIENT;
   return rc == -1;
@@ -339,13 +363,16 @@ Endpoint::~Endpoint() {
   stop_.store(true, std::memory_order_release);
 
   // Stop AR lanes first: their threads touch send groups and poll CQEs.
-  for (auto& lane : ar_lanes_) {
-    if (lane && lane->thread.joinable()) {
-      lane->stop.store(true, std::memory_order_release);
-      lane->thread.join();
+  {
+    std::lock_guard<std::mutex> lanes_lock(ar_lanes_mu_);
+    for (auto& lane : ar_lanes_) {
+      if (lane && lane->thread.joinable()) {
+        lane->stop.store(true, std::memory_order_release);
+        lane->thread.join();
+      }
     }
+    ar_lanes_.clear();
   }
-  ar_lanes_.clear();
 
   if (passive_accept_) {
     passive_accept_stop_.store(true, std::memory_order_release);
@@ -627,7 +654,7 @@ bool Endpoint::reg(void const* data, size_t size, uint64_t& mr_id,
   }
   {
     std::unique_lock<std::shared_mutex> lock(mr_mu_);
-    mr_id_to_mr_[mr_id] = new MR{mr_id, mhandle};
+    mr_id_to_mr_[mr_id] = new MR{mr_id, mhandle, data, size};
   }
 
   return true;
@@ -681,7 +708,7 @@ bool Endpoint::regv(std::vector<void const*> const& data_v,
 
     {
       std::unique_lock<std::shared_mutex> lock(mr_mu_);
-      mr_id_to_mr_[id] = new MR{id, mhandle};
+      mr_id_to_mr_[id] = new MR{id, mhandle, data_v[i], size_v[i]};
     }
     mr_id_v[i] = id;
   }
@@ -700,6 +727,8 @@ bool Endpoint::dereg(uint64_t mr_id) {
     mr = it->second;
     mr_id_to_mr_.erase(mr_id);
   }
+  // Lanes hold a raw mhandle for this MR; stop them before it is freed.
+  stop_lanes_for_mr(mr_id);
   mr->mhandle_->compress_ctx.reset();
   uccl_deregmr(ep_, mr->mhandle_);
   delete mr->mhandle_;
@@ -829,11 +858,10 @@ bool Endpoint::readv(uint64_t conn_id, std::vector<uint64_t> const& mr_id_v,
     }
   }
 
-  // Enable doorbell-batched posting for the duration of this call.
-  struct BatchGuard {
-    BatchGuard() { g_uccl_batch_post = true; }
-    ~BatchGuard() { g_uccl_batch_post = false; }
-  } batch_guard;
+  // Enable doorbell-batched posting for the duration of this call. All
+  // submit_request() calls from this thread accumulate WRs per channel; we
+  // flush once per outer pass before polling.
+  BatchGuard batch_guard;
 
   // Resolve the send group once so per-slot completion checks avoid the
   // per-call shared_lock + map.find().
@@ -1160,10 +1188,7 @@ bool Endpoint::writev(uint64_t conn_id, std::vector<uint64_t> const& mr_id_v,
   // Enable doorbell-batched posting for the duration of this call. All
   // submit_request() calls from this thread accumulate WRs per channel; we
   // flush once per outer pass before polling.
-  struct BatchGuard {
-    BatchGuard() { g_uccl_batch_post = true; }
-    ~BatchGuard() { g_uccl_batch_post = false; }
-  } batch_guard;
+  BatchGuard batch_guard;
 
   // Resolve the send group once so per-slot completion checks avoid the
   // per-call shared_lock + map.find().
@@ -1286,6 +1311,7 @@ bool Endpoint::write_all_async(std::vector<uint64_t> const& conn_ids,
                                uint64_t mr_id, void* src, size_t size,
                                std::vector<FifoItem> const& slot_items,
                                uint64_t* transfer_id) {
+  *transfer_id = 0;
   if (size > kDirectAsyncNetThreshold) {
     std::cerr << "[write_all_async] size " << size
               << " exceeds direct threshold " << kDirectAsyncNetThreshold
@@ -1312,10 +1338,7 @@ bool Endpoint::write_all_async(std::vector<uint64_t> const& conn_ids,
   *transfer_id = reinterpret_cast<uint64_t>(status);
 
   // Doorbell-batched posting: WRs accumulate per channel, flushed once below.
-  struct BatchGuard {
-    BatchGuard() { g_uccl_batch_post = true; }
-    ~BatchGuard() { g_uccl_batch_post = false; }
-  } batch_guard;
+  BatchGuard batch_guard;
 
   bool ok = true;
   for (size_t i = 0; i < n; ++i) {
@@ -1360,28 +1383,38 @@ bool Endpoint::wait_async(uint64_t transfer_id, uint64_t timeout_us) {
           ? std::chrono::steady_clock::time_point::max()
           : std::chrono::steady_clock::now() +
                 std::chrono::microseconds(timeout_us);
-  while (!status->done.load(std::memory_order_acquire)) {
-    bool all_done = true;
-    if (status->poll_net_ureq_batch) {
-      uccl_drive_send(ep_);
-      for (size_t i = 0; i < status->batch_ureqs.size(); ++i) {
-        if (status->batch_pending[i] &&
-            uccl_check_ureq_once(ep_, &status->batch_ureqs[i])) {
-          status->batch_pending[i] = false;
-        }
-        if (status->batch_pending[i]) all_done = false;
-      }
-    } else if (status->poll_net_ureq) {
-      if (!uccl_poll_ureq_once(ep_, &status->ureq)) all_done = false;
+  uint64_t spin = 0;
+  while (true) {
+    // Single-owner reclamation: if another thread already freed this status,
+    // bail out without touching it again.
+    if (status->reclaimed.load(std::memory_order_acquire)) {
+      return status->done.load(std::memory_order_acquire);
     }
-    if (all_done) break;
-    auto _ = inside_python ? (check_python_signals(), nullptr) : nullptr;
+    if (status->poll_net_ureq_batch) {
+      if (poll_batch_ureqs(ep_, status)) break;
+    } else if (status->poll_net_ureq) {
+      if (uccl_poll_ureq_once(ep_, &status->ureq)) break;
+    } else if (status->task_ptr) {
+      // Task-based transfers (writev_async, large write_async/read_async):
+      // the send/recv proxy thread completes them via status->done.
+      if (status->done.load(std::memory_order_acquire)) break;
+    } else {
+      // Nothing to poll and no task: treat as complete.
+      break;
+    }
+    if ((++spin & 1023) == 0 && inside_python) {
+      check_python_signals();
+    }
     if (std::chrono::steady_clock::now() >= deadline) {
       return false;
     }
     std::this_thread::yield();
   }
   status->done.store(true, std::memory_order_release);
+  if (status->reclaimed.exchange(true, std::memory_order_acq_rel)) {
+    // Another thread freed it concurrently — do not touch.
+    return true;
+  }
   delete status;
   return true;
 }
@@ -1395,6 +1428,7 @@ bool Endpoint::wait_flags(std::vector<uint64_t> const& flag_addrs, int32_t seq,
           : std::chrono::steady_clock::now() +
                 std::chrono::microseconds(timeout_us);
   size_t const n = flag_addrs.size();
+  uint64_t spin = 0;
   while (true) {
     bool all_ready = true;
     for (size_t i = 0; i < n; ++i) {
@@ -1405,7 +1439,9 @@ bool Endpoint::wait_flags(std::vector<uint64_t> const& flag_addrs, int32_t seq,
       }
     }
     if (all_ready) return true;
-    auto _ = inside_python ? (check_python_signals(), nullptr) : nullptr;
+    if ((++spin & 1023) == 0 && inside_python) {
+      check_python_signals();
+    }
     if (std::chrono::steady_clock::now() >= deadline) {
       return false;
     }
@@ -1418,7 +1454,8 @@ bool Endpoint::ar_lane_setup(
     uint64_t send_ring_ptr, size_t stride, size_t num_slots, uint64_t seq_ptr,
     std::vector<std::vector<std::string>> const& item_blobs,
     uint64_t& lane_id) {
-  if (num_slots == 0 || stride == 0 ||
+  lane_id = 0;
+  if (num_slots == 0 || stride == 0 || stride > UINT32_MAX ||
       item_blobs.size() != conn_ids.size() || conn_ids.empty()) {
     std::cerr << "[ar_lane_setup] invalid arguments" << std::endl;
     return false;
@@ -1428,10 +1465,33 @@ bool Endpoint::ar_lane_setup(
     std::cerr << "[ar_lane_setup] Error: Invalid mr_id " << mr_id << std::endl;
     return false;
   }
+  // Validate the send ring geometry against the registered MR span: a
+  // misconfigured ring would otherwise RDMA-write out-of-bounds host memory.
+  void* ring_base = reinterpret_cast<void*>(send_ring_ptr);
+  {
+    std::shared_lock<std::shared_mutex> lock(mr_mu_);
+    auto it = mr_id_to_mr_.find(mr_id);
+    if (it == mr_id_to_mr_.end()) {
+      std::cerr << "[ar_lane_setup] Error: Invalid mr_id " << mr_id
+                << std::endl;
+      return false;
+    }
+    MR* mr = it->second;
+    auto const* begin = static_cast<uint8_t const*>(mr->data_);
+    auto const* end = begin + mr->size_;
+    auto const* r = static_cast<uint8_t const*>(ring_base);
+    if (r < begin || r + num_slots * stride > end) {
+      std::cerr << "[ar_lane_setup] ring [" << static_cast<void const*>(r)
+                << ", " << static_cast<void const*>(r + num_slots * stride)
+                << ") is outside registered mr_id " << mr_id << std::endl;
+      return false;
+    }
+  }
 
   auto lane = std::make_unique<ArLane>();
   lane->mhandle = mhandle;
-  lane->ring_base = reinterpret_cast<void*>(send_ring_ptr);
+  lane->mr_id = mr_id;
+  lane->ring_base = ring_base;
   lane->stride = stride;
   lane->num_slots = num_slots;
   lane->seq_word = reinterpret_cast<int32_t*>(seq_ptr);
@@ -1444,6 +1504,7 @@ bool Endpoint::ar_lane_setup(
       return false;
     }
     auto& pc = lane->peers[i];
+    pc.conn_id = conn_ids[i];
     pc.conn = conn;
     // Channel setup may race a fresh connect(); retry briefly.
     for (int attempt = 0;; ++attempt) {
@@ -1475,6 +1536,7 @@ bool Endpoint::ar_lane_setup(
     }
   }
 
+  std::lock_guard<std::mutex> lanes_lock(ar_lanes_mu_);
   lane_id = ar_lanes_.size();
   ar_lanes_.push_back(std::move(lane));
   ArLane* l = ar_lanes_.back().get();
@@ -1483,6 +1545,7 @@ bool Endpoint::ar_lane_setup(
 }
 
 bool Endpoint::ar_lane_stop(uint64_t lane_id) {
+  std::lock_guard<std::mutex> lanes_lock(ar_lanes_mu_);
   if (lane_id >= ar_lanes_.size() || ar_lanes_[lane_id] == nullptr) {
     return false;
   }
@@ -1494,83 +1557,123 @@ bool Endpoint::ar_lane_stop(uint64_t lane_id) {
   return true;
 }
 
+bool Endpoint::stop_lanes_for_conn(uint64_t conn_id) {
+  bool stopped = false;
+  std::lock_guard<std::mutex> lanes_lock(ar_lanes_mu_);
+  for (auto& lane_uptr : ar_lanes_) {
+    auto* lane = lane_uptr.get();
+    if (lane == nullptr) continue;
+    bool uses = false;
+    for (auto const& pc : lane->peers) {
+      if (pc.conn_id == conn_id) {
+        uses = true;
+        break;
+      }
+    }
+    if (uses && lane->thread.joinable()) {
+      lane->stop.store(true, std::memory_order_release);
+      lane->thread.join();
+      stopped = true;
+    }
+  }
+  return stopped;
+}
+
+bool Endpoint::stop_lanes_for_mr(uint64_t mr_id) {
+  bool stopped = false;
+  std::lock_guard<std::mutex> lanes_lock(ar_lanes_mu_);
+  for (auto& lane_uptr : ar_lanes_) {
+    auto* lane = lane_uptr.get();
+    if (lane == nullptr) continue;
+    if (lane->mr_id == mr_id && lane->thread.joinable()) {
+      lane->stop.store(true, std::memory_order_release);
+      lane->thread.join();
+      stopped = true;
+    }
+  }
+  return stopped;
+}
+
 void Endpoint::ar_lane_thread_func(ArLane* lane) {
   uccl::pin_thread_to_numa(numa_node_);
   int32_t* seq_word = lane->seq_word;
   uint64_t idle_spins = 0;
+  uint64_t fail_logs = 0;
   while (!lane->stop.load(std::memory_order_acquire)) {
     int32_t const seq = __atomic_load_n(seq_word, __ATOMIC_ACQUIRE);
-    if (seq <= lane->last_seq) {
-      // Reap local CQEs so slots become reusable; spin with yield hint.
-      bool reaped = false;
-      for (auto& pc : lane->peers) {
-        for (size_t k = 0; k < lane->num_slots; ++k) {
-          if (pc.slot_inflight[k] &&
-              uccl_check_wr_fast(pc.send_group, pc.ureqs[k].engine_idx)) {
-            pc.slot_inflight[k] = false;
-            reaped = true;
-          }
-        }
-      }
-      if (!reaped && (++idle_spins & 63) == 0) {
-        std::this_thread::yield();
-      }
-      continue;
-    }
-    idle_spins = 0;
-    // Post rounds in order up to the published seq.
-    while (lane->last_seq < seq &&
-           !lane->stop.load(std::memory_order_acquire)) {
+    if (seq > lane->last_seq) {
+      idle_spins = 0;
+      // Attempt the next round in order: post one WR per peer through the
+      // pre-resolved group. A round advances only when EVERY peer posted —
+      // a failed post is retried on the next pass so no peer silently
+      // misses the round (its receiver flag would never reach seq).
       int32_t const target = lane->last_seq + 1;
       size_t const slot =
           (static_cast<size_t>(target - 1)) % lane->num_slots;
-      // Re-posting a WR template requires the prior post of that slot to be
-      // locally acked. If still inflight, drive the poller and retry the
-      // outer loop (the producer is seq-gated, so this is rare).
-      bool blocked = false;
-      for (auto& pc : lane->peers) {
-        if (pc.slot_inflight[slot] &&
-            !uccl_check_wr_fast(pc.send_group, pc.ureqs[slot].engine_idx)) {
-          blocked = true;
-          break;
-        }
-      }
-      if (blocked) {
-        uccl_drive_send(ep_);
-        std::this_thread::yield();
-        break;
-      }
+      bool blocked = false;  // slot still awaiting a local CQE (prior round)
+      bool failed = false;   // post error on at least one peer
       {
-        struct BatchGuard {
-          BatchGuard() { g_uccl_batch_post = true; }
-          ~BatchGuard() { g_uccl_batch_post = false; }
-        } batch_guard;
-        void* src =
-            static_cast<char*>(lane->ring_base) + slot * lane->stride;
+        BatchGuard batch_guard;
         for (auto& pc : lane->peers) {
-          UcclRequest ureq{};
-          int rc;
-          do {
-            rc = uccl_write_async_on_group(pc.send_group, pc.conn,
-                                           lane->mhandle, src, lane->stride,
-                                           pc.items[slot], &ureq);
-          } while (is_retryable_post_failure(rc));
-          if (rc < 0) {
-            UCCL_LOG(ERROR) << "[ar_lane] post failed for slot " << slot
-                            << ": rc=" << rc;
-            continue;
+          if (pc.posted_seq >= target) continue;
+          if (pc.slot_inflight[slot] &&
+              !uccl_check_wr_fast(pc.send_group, pc.ureqs[slot].engine_idx)) {
+            blocked = true;
+            break;
           }
-          pc.ureqs[slot] = ureq;
-          pc.slot_inflight[slot] = true;
+        }
+        if (!blocked) {
+          void* src =
+              static_cast<char*>(lane->ring_base) + slot * lane->stride;
+          for (auto& pc : lane->peers) {
+            if (pc.posted_seq >= target) continue;
+            UcclRequest ureq{};
+            int rc;
+            do {
+              rc = uccl_write_async_on_group(pc.send_group, pc.conn,
+                                             lane->mhandle, src, lane->stride,
+                                             pc.items[slot], &ureq);
+            } while (is_retryable_post_failure(rc));
+            if (rc < 0) {
+              failed = true;
+              break;
+            }
+            pc.ureqs[slot] = ureq;
+            pc.slot_inflight[slot] = true;
+            pc.posted_seq = target;
+          }
         }
       }
-      uccl_flush_send(ep_);
-      uccl_drive_send(ep_);
-      lane->last_seq = target;
+      if (!blocked) {
+        uccl_flush_send(ep_);
+        uccl_drive_send(ep_);
+        if (!failed) {
+          lane->last_seq = target;
+        } else if ((++fail_logs & 1023) == 1) {
+          UCCL_LOG(ERROR) << "[ar_lane] post failed for target seq " << target
+                          << "; retrying (receiver flag would never reach "
+                             "seq otherwise)";
+        }
+      }
+      continue;
+    }
+    // Published seq is caught up: reap local CQEs so slots become reusable;
+    // spin with an occasional yield hint.
+    bool reaped = false;
+    for (auto& pc : lane->peers) {
+      for (size_t k = 0; k < lane->num_slots; ++k) {
+        if (pc.slot_inflight[k] &&
+            uccl_check_wr_fast(pc.send_group, pc.ureqs[k].engine_idx)) {
+          pc.slot_inflight[k] = false;
+          reaped = true;
+        }
+      }
+    }
+    if (!reaped && (++idle_spins & 63) == 0) {
+      std::this_thread::yield();
     }
   }
 }
-
 bool Endpoint::advertise(uint64_t mr_id, void* addr, size_t len,
                          char* out_buf) {
 #if defined(__CAMBRICON_PLATFORM_MLU__)
@@ -2516,6 +2619,10 @@ bool Endpoint::remove_remote_endpoint(uint64_t conn_id) {
   Conn* conn = it->second;
   uint64_t loopback_conn_id = conn->rdma_loopback_conn_id_;
 
+  // Lanes hold raw Conn*/SendConnection* for their peers; stop any lane that
+  // uses this conn (or its loopback) before the objects are freed.
+  stop_lanes_for_conn(conn_id);
+
   // Detach shared memory if this was a local connection
   if (conn->shm_attached_) {
     auto& shm = conn->remote_inbox_;
@@ -2535,6 +2642,7 @@ bool Endpoint::remove_remote_endpoint(uint64_t conn_id) {
   conn_id_to_conn_.erase(it);
 
   if (loopback_conn_id != UINT64_MAX) {
+    stop_lanes_for_conn(loopback_conn_id);
     auto loopback_it = conn_id_to_conn_.find(loopback_conn_id);
     if (loopback_it != conn_id_to_conn_.end()) {
       Conn* loopback_conn = loopback_it->second;
@@ -2564,18 +2672,17 @@ bool Endpoint::start_passive_accept() {
 
 bool Endpoint::poll_async(uint64_t transfer_id, bool* is_done) {
   auto* status = reinterpret_cast<TransferStatus*>(transfer_id);
+  if (status->reclaimed.load(std::memory_order_acquire)) {
+    // Already freed by wait_async (or another poller) — report done state
+    // without touching the object further.
+    *is_done = true;
+    return true;
+  }
   if (status->poll_net_ureq_batch &&
       !status->done.load(std::memory_order_acquire)) {
-    uccl_drive_send(ep_);
-    bool all_done = true;
-    for (size_t i = 0; i < status->batch_ureqs.size(); ++i) {
-      if (status->batch_pending[i] &&
-          uccl_check_ureq_once(ep_, &status->batch_ureqs[i])) {
-        status->batch_pending[i] = false;
-      }
-      if (status->batch_pending[i]) all_done = false;
+    if (poll_batch_ureqs(ep_, status)) {
+      status->done.store(true, std::memory_order_release);
     }
-    if (all_done) status->done.store(true, std::memory_order_release);
   }
   if (status->poll_net_ureq && !status->done.load(std::memory_order_acquire)) {
     if (uccl_poll_ureq_once(ep_, &status->ureq)) {
@@ -2584,6 +2691,10 @@ bool Endpoint::poll_async(uint64_t transfer_id, bool* is_done) {
   }
   *is_done = status->done.load(std::memory_order_acquire);
   if (*is_done) {
+    if (status->reclaimed.exchange(true, std::memory_order_acq_rel)) {
+      // Another thread freed it concurrently — do not touch.
+      return true;
+    }
     delete status;
   }
   return true;
