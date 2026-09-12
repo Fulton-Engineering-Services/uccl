@@ -1063,6 +1063,21 @@ NB_MODULE(p2p, m) {
           },
           "Stop an AR lane's posting thread.", nb::arg("lane_id"))
       .def(
+          "ar_lane_publish",
+          [](Endpoint& self, uint64_t lane_id, int32_t seq) {
+            bool ok;
+            {
+              nb::gil_scoped_release release;
+              InsidePythonGuard guard;
+              ok = self.ar_lane_publish(lane_id, seq);
+            }
+            return ok;
+          },
+          "Release-publish a round seq to an AR lane: stores seq into the "
+          "ring slot's trailing flag, then into the seq word with release "
+          "ordering (safe on weakly-ordered ARM).",
+          nb::arg("lane_id"), nb::arg("seq"))
+      .def(
           "advertise",
           [](Endpoint& self, uint64_t mr_id,
              uint64_t ptr,  // raw pointer passed from Python

@@ -266,7 +266,8 @@ struct ArLane {
   };
   std::vector<PeerCtx> peers;
   P2PMhandle* mhandle = nullptr;
-  uint64_t mr_id = 0;  // for lifetime coordination with dereg()
+  uint64_t mr_id = 0;      // for lifetime coordination with dereg()
+  uint64_t seq_mr_id = 0;  // MR owning the seq word; dereg() stops the lane
   void* ring_base = nullptr;  // num_slots x stride bytes, [data | seq flag]
   size_t stride = 0;
   size_t num_slots = 0;
@@ -418,6 +419,12 @@ class Endpoint {
 
   /* Stop a lane's posting thread (blocks until it exits). */
   bool ar_lane_stop(uint64_t lane_id);
+
+  /* Release-publish a round seq to a lane: stores the seq into the ring
+   * slot's trailing flag, then into the seq word with release ordering so
+   * the lane thread's acquire load observes flag/data before seq — ordering
+   * plain producer-side stores cannot guarantee on weakly-ordered ARM. */
+  bool ar_lane_publish(uint64_t lane_id, int32_t seq);
 
  private:
   /* AR lane posting loop (runs on the lane's dedicated thread). */

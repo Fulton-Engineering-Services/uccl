@@ -1335,7 +1335,9 @@ bool Endpoint::write_all_async(std::vector<uint64_t> const& conn_ids,
   status->poll_net_ureq_batch = true;
   status->batch_ureqs.resize(n);
   status->batch_pending.assign(n, true);
-  *transfer_id = register_transfer(status);
+  // NOTE: the status is registered (and the id published) only AFTER the
+  // post loop below — a concurrent waiter on a guessable monotonic id must
+  // never observe a half-initialized batch.
 
   // Doorbell-batched posting: WRs accumulate per channel, flushed once below.
   BatchGuard batch_guard;
@@ -1373,7 +1375,15 @@ bool Endpoint::write_all_async(std::vector<uint64_t> const& conn_ids,
 
   uccl_flush_send(ep_);
   uccl_drive_send(ep_);
-  return ok;
+  if (!ok) {
+    // Do not publish a half-posted batch: posted WRs complete on the QP on
+    // their own (their completions are reaped by later drive calls), and
+    // transfer_id stays 0 so the caller has nothing to wait on or leak.
+    delete status;
+    return false;
+  }
+  *transfer_id = register_transfer(status);
+  return true;
 }
 
 bool Endpoint::wait_async(uint64_t transfer_id, uint64_t timeout_us) {
@@ -1415,7 +1425,10 @@ bool Endpoint::wait_async(uint64_t transfer_id, uint64_t timeout_us) {
       timed_out = true;
       break;
     }
-    std::this_thread::yield();
+    // Latency-critical: spin cheaply and pay the sched_yield syscall only
+    // once per 64 iterations (a per-iteration yield measurably inflates the
+    // mean and tail of small-message waits).
+    if ((spin & 63) == 0) std::this_thread::yield();
   }
   if (timed_out) {
     end_wait(transfer_id, status, /*completed=*/false);
@@ -1453,7 +1466,8 @@ bool Endpoint::wait_flags(std::vector<uint64_t> const& flag_addrs, int32_t seq,
     if (std::chrono::steady_clock::now() >= deadline) {
       return false;
     }
-    std::this_thread::yield();
+    // Latency-critical: sched_yield only once per 64 spins (see wait_async).
+    if ((spin & 63) == 0) std::this_thread::yield();
   }
 }
 
@@ -1477,16 +1491,12 @@ ClaimResult Endpoint::begin_wait(uint64_t transfer_id, TransferStatus** out) {
 }
 
 ClaimResult Endpoint::begin_poll(uint64_t transfer_id, TransferStatus** out) {
-  std::lock_guard<std::mutex> lock(transfer_status_mu_);
-  auto it = active_transfers_.find(transfer_id);
-  if (it == active_transfers_.end()) return ClaimResult::Unknown;
-  if (it->second.claimed) return ClaimResult::Busy;
-  // Same keep-and-flag protocol as begin_wait: the entry stays in the map
-  // flagged claimed for the duration of this poll pass, so concurrent
-  // waiters/pollers see Busy (in progress) — never Unknown for a live id.
-  it->second.claimed = true;
-  *out = it->second.status;
-  return ClaimResult::Ok;
+  // Poll and wait share ONE keep-and-flag claim protocol (implemented in
+  // begin_wait): the entry stays in the map flagged claimed for the duration
+  // of this poll pass, so concurrent waiters/pollers see Busy (in progress)
+  // — never Unknown for a live id. Do not fork this logic (it diverged once
+  // and produced false completions between concurrent poll/wait).
+  return begin_wait(transfer_id, out);
 }
 
 void Endpoint::end_wait(uint64_t transfer_id, TransferStatus* status,
@@ -1503,14 +1513,7 @@ void Endpoint::end_wait(uint64_t transfer_id, TransferStatus* status,
 
 void Endpoint::end_poll(uint64_t transfer_id, TransferStatus* status,
                         bool completed) {
-  std::lock_guard<std::mutex> lock(transfer_status_mu_);
-  if (completed) {
-    active_transfers_.erase(transfer_id);
-  } else {
-    auto& entry = active_transfers_[transfer_id];
-    entry.status = status;
-    entry.claimed = false;
-  }
+  end_wait(transfer_id, status, completed);  // single shared protocol
 }
 
 bool Endpoint::ar_lane_setup(
@@ -1524,23 +1527,29 @@ bool Endpoint::ar_lane_setup(
     std::cerr << "[ar_lane_setup] invalid arguments" << std::endl;
     return false;
   }
-  P2PMhandle* mhandle = get_mhandle(mr_id);
-  if (unlikely(mhandle == nullptr)) {
+  // Hold the conn and MR locks (shared) for the WHOLE setup, in the same
+  // nesting order used by remove_remote_endpoint (conn_mu_ -> ar_lanes_mu_):
+  // the lane thread will hold raw Conn*/SendConnection*/P2PMhandle* pointers,
+  // so conn/MR teardown must be excluded until the lane is published in
+  // ar_lanes_ — after which the stop_lanes_for_* sweeps in
+  // remove_remote_endpoint()/dereg() stop it before freeing. (Direct map
+  // lookups below instead of get_conn/get_mhandle: recursive shared locking
+  // of a shared_mutex is UB.)
+  std::shared_lock<std::shared_mutex> conn_lock(conn_mu_);
+  std::shared_lock<std::shared_mutex> mr_lock(mr_mu_);
+
+  auto mr_it = mr_id_to_mr_.find(mr_id);
+  if (unlikely(mr_it == mr_id_to_mr_.end())) {
     std::cerr << "[ar_lane_setup] Error: Invalid mr_id " << mr_id << std::endl;
     return false;
   }
+  MR* mr = mr_it->second;
+  P2PMhandle* mhandle = mr->mhandle_;
+
   // Validate the send ring geometry against the registered MR span: a
   // misconfigured ring would otherwise RDMA-write out-of-bounds host memory.
   void* ring_base = reinterpret_cast<void*>(send_ring_ptr);
   {
-    std::shared_lock<std::shared_mutex> lock(mr_mu_);
-    auto it = mr_id_to_mr_.find(mr_id);
-    if (it == mr_id_to_mr_.end()) {
-      std::cerr << "[ar_lane_setup] Error: Invalid mr_id " << mr_id
-                << std::endl;
-      return false;
-    }
-    MR* mr = it->second;
     auto const* begin = static_cast<uint8_t const*>(mr->data_);
     auto const* end = begin + mr->size_;
     auto const* r = static_cast<uint8_t const*>(ring_base);
@@ -1555,21 +1564,46 @@ bool Endpoint::ar_lane_setup(
     }
   }
 
+  // Validate the seq word against the registered MR spans too: the lane
+  // thread dereferences it on every iteration until stopped, so a garbage
+  // pointer is an indefinite engine-thread read of unmapped memory. Record
+  // which MR owns it so dereg() of that MR also stops this lane.
+  uint64_t seq_mr_id = UINT64_MAX;
+  {
+    auto const* s = reinterpret_cast<uint8_t const*>(seq_ptr);
+    for (auto const& entry : mr_id_to_mr_) {
+      auto const* begin = static_cast<uint8_t const*>(entry.second->data_);
+      auto const* end = begin + entry.second->size_;
+      if (s >= begin && s + sizeof(int32_t) <= end) {
+        seq_mr_id = entry.first;
+        break;
+      }
+    }
+    if (seq_mr_id == UINT64_MAX) {
+      std::cerr << "[ar_lane_setup] seq word "
+                << reinterpret_cast<void const*>(seq_ptr)
+                << " is not inside any registered MR" << std::endl;
+      return false;
+    }
+  }
+
   auto lane = std::make_unique<ArLane>();
   lane->mhandle = mhandle;
   lane->mr_id = mr_id;
+  lane->seq_mr_id = seq_mr_id;
   lane->ring_base = ring_base;
   lane->stride = stride;
   lane->num_slots = num_slots;
   lane->seq_word = reinterpret_cast<int32_t*>(seq_ptr);
   lane->peers.resize(conn_ids.size());
   for (size_t i = 0; i < conn_ids.size(); ++i) {
-    auto* conn = get_conn(conn_ids[i]);
-    if (unlikely(conn == nullptr)) {
+    auto conn_it = conn_id_to_conn_.find(conn_ids[i]);
+    if (unlikely(conn_it == conn_id_to_conn_.end())) {
       std::cerr << "[ar_lane_setup] Error: Invalid conn_id " << conn_ids[i]
                 << std::endl;
       return false;
     }
+    Conn* conn = conn_it->second;
     auto& pc = lane->peers[i];
     pc.conn_id = conn_ids[i];
     pc.conn = conn;
@@ -1621,6 +1655,28 @@ bool Endpoint::ar_lane_stop(uint64_t lane_id) {
     lane->stop.store(true, std::memory_order_release);
     lane->thread.join();
   }
+  // Free the lane (PeerCtx vectors, blobs) once joined — ids stay stable
+  // because the slot becomes nullptr rather than being erased.
+  ar_lanes_[lane_id].reset();
+  return true;
+}
+
+bool Endpoint::ar_lane_publish(uint64_t lane_id, int32_t seq) {
+  std::lock_guard<std::mutex> lanes_lock(ar_lanes_mu_);
+  if (lane_id >= ar_lanes_.size() || ar_lanes_[lane_id] == nullptr) {
+    return false;
+  }
+  auto* lane = ar_lanes_[lane_id].get();
+  size_t const slot = (static_cast<size_t>(seq - 1)) % lane->num_slots;
+  auto* flag = reinterpret_cast<int32_t*>(
+      static_cast<char*>(lane->ring_base) + (slot + 1) * lane->stride -
+      sizeof(int32_t));
+  // Release-publish: the seq-word release store orders the flag store (and
+  // the producer's earlier data staging) before the lane thread's acquire
+  // load of the seq word — ordering two plain Python-side stores cannot
+  // guarantee on weakly-ordered architectures (ARM/Grace).
+  __atomic_store_n(flag, seq, __ATOMIC_RELAXED);
+  __atomic_store_n(lane->seq_word, seq, __ATOMIC_RELEASE);
   return true;
 }
 
@@ -1640,6 +1696,7 @@ bool Endpoint::stop_lanes_for_conn(uint64_t conn_id) {
     if (uses && lane->thread.joinable()) {
       lane->stop.store(true, std::memory_order_release);
       lane->thread.join();
+      lane_uptr.reset();
       stopped = true;
     }
   }
@@ -1652,9 +1709,12 @@ bool Endpoint::stop_lanes_for_mr(uint64_t mr_id) {
   for (auto& lane_uptr : ar_lanes_) {
     auto* lane = lane_uptr.get();
     if (lane == nullptr) continue;
-    if (lane->mr_id == mr_id && lane->thread.joinable()) {
+    // Stop lanes whose send ring OR seq word lives in this MR.
+    if ((lane->mr_id == mr_id || lane->seq_mr_id == mr_id) &&
+        lane->thread.joinable()) {
       lane->stop.store(true, std::memory_order_release);
       lane->thread.join();
+      lane_uptr.reset();
       stopped = true;
     }
   }
@@ -1679,6 +1739,12 @@ void Endpoint::ar_lane_thread_func(ArLane* lane) {
           (static_cast<size_t>(target - 1)) % lane->num_slots;
       bool blocked = false;  // slot still awaiting a local CQE (prior round)
       bool failed = false;   // post error on at least one peer
+      // Drive the send poller BEFORE the slot-inflight check: check_wr_fast
+      // only reads the completion tracker, which is advanced exclusively by
+      // send_routine() (no background poller). Without this, a CQE that
+      // arrives after the last post-time drive leaves the tracker stale and
+      // the lane would livelock on the blocked path.
+      uccl_drive_send(ep_);
       {
         BatchGuard batch_guard;
         for (auto& pc : lane->peers) {
@@ -1729,7 +1795,9 @@ void Endpoint::ar_lane_thread_func(ArLane* lane) {
       continue;
     }
     // Published seq is caught up: reap local CQEs so slots become reusable;
-    // spin with an occasional yield hint.
+    // spin with an occasional yield hint. Drive the send poller each pass —
+    // the reap checks read tracker state that only send_routine() advances.
+    uccl_drive_send(ep_);
     bool reaped = false;
     for (auto& pc : lane->peers) {
       for (size_t k = 0; k < lane->num_slots; ++k) {
