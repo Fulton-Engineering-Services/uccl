@@ -1008,11 +1008,31 @@ NB_MODULE(p2p, m) {
           "ar_lane_setup",
           [](Endpoint& self, std::vector<uint64_t> conn_ids, uint64_t mr_id,
              uint64_t ring_ptr, size_t stride, size_t num_slots,
-             uint64_t seq_ptr,
-             std::vector<std::vector<std::string>> item_blobs) {
-            if (item_blobs.size() != conn_ids.size()) {
+             uint64_t seq_ptr, nb::list item_blob_v) {
+            if (nb::len(item_blob_v) != conn_ids.size()) {
               throw std::runtime_error(
                   "item_blobs must have one entry per conn_id");
+            }
+            std::vector<std::vector<std::string>> item_blobs(conn_ids.size());
+            PyObject* outer = item_blob_v.ptr();
+            for (size_t i = 0; i < conn_ids.size(); ++i) {
+              PyObject* inner = PyList_GetItem(outer, i);
+              if (!inner || !PyList_Check(inner)) {
+                throw std::runtime_error("item_blobs[i] must be a list");
+              }
+              Py_ssize_t m = PyList_Size(inner);
+              item_blobs[i].resize(m);
+              for (Py_ssize_t k = 0; k < m; ++k) {
+                char* bytes_data;
+                Py_ssize_t bytes_len;
+                if (PyBytes_AsStringAndSize(PyList_GetItem(inner, k),
+                                            &bytes_data, &bytes_len) != 0 ||
+                    bytes_len != sizeof(FifoItem)) {
+                  throw std::runtime_error(
+                      "item blob must be exactly 64 bytes (serialized FifoItem)");
+                }
+                item_blobs[i][k].assign(bytes_data, bytes_len);
+              }
             }
             uint64_t lane_id;
             bool ok;
