@@ -429,9 +429,11 @@ class Endpoint {
   bool stop_lanes_for_mr(uint64_t mr_id);
 
   /* Out-of-band ownership for transfer ids. Ids are monotonic (not heap
-   * addresses — ABA-safe). A claimed id STAYS in the map flagged claimed so
-   * concurrent pollers distinguish "in progress by another waiter" (report
-   * not-done, never touch the object) from "retired" (report done). */
+   * addresses — ABA-safe). Both wait and poll use the same keep-and-flag
+   * protocol: a claimed id STAYS in the map flagged claimed, so concurrent
+   * callers distinguish "in progress" (Busy: poll reports not-done, wait
+   * returns false; the object is never touched) from "retired" (Unknown:
+   * report done without touching memory). */
   uint64_t register_transfer(TransferStatus* status);
   ClaimResult begin_wait(uint64_t transfer_id, TransferStatus** out);
   ClaimResult begin_poll(uint64_t transfer_id, TransferStatus** out);

@@ -1385,9 +1385,9 @@ bool Endpoint::wait_async(uint64_t transfer_id, uint64_t timeout_us) {
     return true;
   }
   if (claim == ClaimResult::Busy) {
-    // Another wait_async owns this id; it will complete it. Report success
-    // to avoid a second blocking waiter on one id.
-    return true;
+    // Another wait_async owns this id and will complete it. Consistent with
+    // poll_async's Busy semantics: the transfer is still in progress.
+    return false;
   }
   auto const deadline =
       timeout_us == 0
@@ -1481,9 +1481,11 @@ ClaimResult Endpoint::begin_poll(uint64_t transfer_id, TransferStatus** out) {
   auto it = active_transfers_.find(transfer_id);
   if (it == active_transfers_.end()) return ClaimResult::Unknown;
   if (it->second.claimed) return ClaimResult::Busy;
-  // Sole ownership for the duration of this poll pass.
+  // Same keep-and-flag protocol as begin_wait: the entry stays in the map
+  // flagged claimed for the duration of this poll pass, so concurrent
+  // waiters/pollers see Busy (in progress) — never Unknown for a live id.
+  it->second.claimed = true;
   *out = it->second.status;
-  active_transfers_.erase(it);
   return ClaimResult::Ok;
 }
 
@@ -1501,11 +1503,14 @@ void Endpoint::end_wait(uint64_t transfer_id, TransferStatus* status,
 
 void Endpoint::end_poll(uint64_t transfer_id, TransferStatus* status,
                         bool completed) {
-  if (!completed) {
-    std::lock_guard<std::mutex> lock(transfer_status_mu_);
-    active_transfers_[transfer_id] = TransferEntry{status, /*claimed=*/false};
+  std::lock_guard<std::mutex> lock(transfer_status_mu_);
+  if (completed) {
+    active_transfers_.erase(transfer_id);
+  } else {
+    auto& entry = active_transfers_[transfer_id];
+    entry.status = status;
+    entry.claimed = false;
   }
-  // completed: the id was already erased by begin_poll.
 }
 
 bool Endpoint::ar_lane_setup(
